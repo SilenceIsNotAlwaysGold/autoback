@@ -47,18 +47,13 @@ jobs:
           dir dist\dy_auto_reply
 
       - name: Copy docs into dist
-        shell: cmd
+        shell: pwsh
         run: |
-          copy 使用说明.txt dist\dy_auto_reply\ 2>nul
-          copy 教程.md dist\dy_auto_reply\ 2>nul
-          if not exist "dist\dy_auto_reply\使用说明.txt" (
-            echo 抖音自动回复 - Windows > "dist\dy_auto_reply\README.txt"
-            echo. >> "dist\dy_auto_reply\README.txt"
-            echo 双击 dy_auto_reply.exe 启动 >> "dist\dy_auto_reply\README.txt"
-            echo 首次启动会下载 Chromium 浏览器内核（约 150MB），请等待 1-2 分钟 >> "dist\dy_auto_reply\README.txt"
-            echo. >> "dist\dy_auto_reply\README.txt"
-            echo 如果 Windows Defender 拦截，请选择"仍要运行" >> "dist\dy_auto_reply\README.txt"
-          )
+          Get-ChildItem -Path "使用说明.txt", "教程-Windows.md", "README.md" -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName "dist\dy_auto_reply\" -Force
+          }
+          Write-Host "--- dist contents ---"
+          Get-ChildItem dist\dy_auto_reply | Select-Object Name, Length
 
       - name: Zip artifact
         shell: pwsh
