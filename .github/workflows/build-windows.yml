@@ -1,0 +1,72 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "launcher_app.py"
+      - "dy_auto_reply_win.spec"
+      - "requirements-build.txt"
+      - "scripts/**"
+      - "platforms/**"
+      - "shared/**"
+      - "config/dy_reply.example.yaml"
+      - ".github/workflows/build-windows.yml"
+  workflow_dispatch:   # 允许在 Actions 页面手动触发
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build dependencies
+        shell: cmd
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: Build with PyInstaller
+        shell: cmd
+        run: |
+          pyinstaller dy_auto_reply_win.spec --clean --noconfirm
+
+      - name: List build output
+        shell: cmd
+        run: |
+          dir dist\dy_auto_reply
+
+      - name: Copy docs into dist
+        shell: cmd
+        run: |
+          copy 使用说明.txt dist\dy_auto_reply\ 2>nul
+          copy 教程.md dist\dy_auto_reply\ 2>nul
+          if not exist "dist\dy_auto_reply\使用说明.txt" (
+            echo 抖音自动回复 - Windows > "dist\dy_auto_reply\README.txt"
+            echo. >> "dist\dy_auto_reply\README.txt"
+            echo 双击 dy_auto_reply.exe 启动 >> "dist\dy_auto_reply\README.txt"
+            echo 首次启动会下载 Chromium 浏览器内核（约 150MB），请等待 1-2 分钟 >> "dist\dy_auto_reply\README.txt"
+            echo. >> "dist\dy_auto_reply\README.txt"
+            echo 如果 Windows Defender 拦截，请选择"仍要运行" >> "dist\dy_auto_reply\README.txt"
+          )
+
+      - name: Zip artifact
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\dy_auto_reply\* -DestinationPath dist\dy_auto_reply_windows.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dy_auto_reply-windows
+          path: dist/dy_auto_reply_windows.zip
+          retention-days: 14

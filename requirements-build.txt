@@ -1,0 +1,16 @@
+# 桌面应用打包依赖（最小集，CI 用）
+fastapi==0.135.3
+uvicorn[standard]==0.44.0
+pydantic==2.12.5
+pydantic-settings==2.13.1
+starlette==1.0.0
+h11==0.16.0
+anyio==4.13.0
+
+httpx==0.28.1
+PyYAML==6.0.3
+playwright==1.58.0
+python-socks==2.8.1
+
+pyinstaller==6.20.0
+pyinstaller-hooks-contrib==2026.4

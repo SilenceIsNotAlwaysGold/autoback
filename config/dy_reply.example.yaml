@@ -1,0 +1,120 @@
+# 抖音自动回复脚本配置示例（10+ 账号矩阵模式）
+# 用法：cp dy_reply.example.yaml dy_reply.yaml && 编辑后 python scripts/dy_auto_reply.py
+
+# ── 运行时参数 ──────────────────────────────────
+runtime:
+  # 同时活跃的账号数（全部账号并发跑会吃 RAM，建议 3-5）
+  # 为 0 或未设置时表示不限制（全账号并发）
+  max_concurrent: 5
+  # 账号启动错峰（秒），避免 10 个号同一秒打开浏览器
+  startup_stagger: 3
+
+browser:
+  # 生产跑建议 true 省资源；首次扫码登录必须 false
+  headless: false
+
+store:
+  db_path: data/dy_reply.db
+
+# ── 账号列表 ─────────────────────────────────────
+# 每个账号可独立配置代理 / 比特浏览器窗口
+# 未填代理/比特浏览器时走本地 Playwright（账号级指纹隔离已内置）
+accounts:
+  - name: dy_acc1
+    login_timeout: 180
+    # ──── 方案 A：纯本地 profile（1-3 号可用）
+    # 留空即可
+
+  - name: dy_acc2
+    login_timeout: 180
+    # ──── 方案 B：HTTP/SOCKS5 代理（3-10 号推荐静态住宅代理）
+    proxy_url: "http://user:pass@1.2.3.4:8080"
+
+  - name: dy_acc3
+    login_timeout: 180
+    # ──── 方案 C：比特浏览器窗口（10+ 号推荐）
+    # 需先在比特浏览器客户端里创建窗口，复制窗口 ID 填在这里
+    # 窗口里已配置好代理 + 独立指纹，脚本 CDP 连接即可
+    bitbrowser_id: "abc123def456"
+
+  # ... 可继续加 dy_acc4 ~ dy_accN
+
+# ── 私信自动回复 ─────────────────────────────────
+# 真实入口：/creator-micro/data/following/chat
+# 列表拉取已支持；发送回复需点进具体会话（详情页 DOM 后续探测）
+messenger:
+  enabled: true
+  max_replies_per_round: 20
+  poll_interval: 60
+  max_per_day: 200
+
+# ── 评论自动回复 ─────────────────────────────────
+commenter:
+  enabled: true
+  max_replies_per_round: 30
+  poll_interval: 120
+  max_per_day: 300
+  per_reply_delay: [5, 15]
+
+# ── 规则匹配（私信 + 评论共用）─────────────────────
+# 字段说明：
+#   keywords        — 逗号分隔关键词
+#   match_mode      — contains(默认) / exact / regex
+#   reply_text      — 纯文字回复
+#   reply_texts     — 多条随机选一（优先于 reply_text）
+#   reply_image     — 图片回复（PNG/JPG 路径，相对项目根目录）
+#   reply_text_after — 图片之后再发的文字（可选）
+#   is_default      — 无规则命中时的兜底
+#
+# 组合玩法：
+#   A) 纯文字        → 只配 reply_text
+#   B) 纯图片        → 只配 reply_image
+#   C) 文字+图片     → 同时配 reply_text + reply_image（先发文字再发图）
+#   D) 图片+引导语   → 只配 reply_image + reply_text_after（先图后文）
+#   E) 全组合        → text → image → text_after 三段依次发送
+rules:
+  - keywords: "价格,多少钱,怎么卖"
+    match_mode: contains
+    reply_texts:
+      - "您好，具体价格可以私信我哦~"
+      - "您好，价格详情私信咨询呢~"
+
+  # 图片回复示例：匹配"加微信"类关键词 → 发二维码图 + 引导语
+  - keywords: "微信,加vx,vx,加v,联系方式,手机号"
+    match_mode: contains
+    reply_image: data/cards/wechat_qr.png
+    reply_text_after: "扫码加我微信哦~"
+
+  - keywords: "好看,漂亮,棒"
+    match_mode: contains
+    reply_texts:
+      - "谢谢支持！❤️"
+      - "感谢宝子的喜欢~"
+
+  - is_default: true
+    reply_text: "感谢您的关注，我们稍后回复您~"
+
+# ── AI 兜底（DeepSeek）──────────────────────────
+ai:
+  enabled: false
+  api_base: https://api.deepseek.com/v1
+  api_key: "sk-xxx"
+  model: deepseek-chat
+  custom_prompts:
+    default: |
+      你是{platform}上的友好创作者，正在回复粉丝的私信或评论。
+
+      要求：
+      1. 回复简短自然（不超过 30 字），像真人聊天
+      2. 语气温暖友好，适度用 emoji
+      3. 不要透露个人联系方式（微信/电话等）
+      4. 遇到不了解的问题，引导粉丝私信详聊
+
+      粉丝最新消息：{message}
+
+      你的回复：
+
+# ── 用户级冷却（秒）─────────────────────────────
+# 同一用户在该时间窗口内不会被重复回复；跨重启持久（基于 SQLite 时间戳）
+# 默认 30s。设为 0 = 不冷却（每条消息都尝试回）
+user_reply_cooldown_sec: 30

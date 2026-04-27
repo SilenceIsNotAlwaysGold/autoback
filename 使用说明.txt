@@ -1,0 +1,38 @@
+抖音自动回复 - Windows 版（快速上手）
+=====================================
+
+【系统要求】
+- Windows 10/11 x64
+- 联网（首次启动会下载浏览器内核约 150 MB）
+
+【三步上手】
+
+1. 解压并打开
+   - 解压 dy_auto_reply_windows.zip 到任意位置
+   - 右键 dy_auto_reply.exe -> 「以管理员身份运行」（绕过 SmartScreen）
+   - 第一次启动需 1-2 分钟下载浏览器内核
+
+2. 配置账号
+   - 浏览器自动打开 http://127.0.0.1:8020
+   - 「账号管理」Tab -> 添加账号 + 填代理 URL
+   - 点「扫码登录」用手机扫码
+
+3. 配置规则 + 启动
+   - 「关键词规则」Tab -> 加规则
+   - 顶栏「启动主脚本」开始运行
+
+详细教程见 教程-Windows.md
+
+【数据位置】
+%APPDATA%\dy_auto_reply\
+   config\dy_reply.yaml      ← 配置
+   data\dy_reply.db          ← 回复记录
+   data\browser_profiles\    ← 各账号登录态
+   logs\dy_main.log          ← 运行日志
+
+【清空数据】
+删除上述目录即可，下次启动自动重建。
+
+【杀毒软件误报】
+PyInstaller 打包的 .exe 经常被 Defender/360 误报为木马。
+把 dy_auto_reply.exe 加白名单即可。

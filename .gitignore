@@ -1,0 +1,51 @@
+*.pyc
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+
+# Browser data
+browser_data/
+
+# Database
+data/*.db
+data/*.db-journal
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cache
+.mypy_cache/
+.coverage
+.pytest_cache/
+pytest-cache-files-*/
+
+# Local runtime/temp
+.tmp/
+.venv/
+.venv.broken/
+.worktrees/
+
+# Frontend build/deps
+frontend/node_modules/
+frontend/dist/
+
+# Config with secrets
+autofish/config/config.yaml
+douying/config/config.yaml
+config/dy_reply.yaml
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
