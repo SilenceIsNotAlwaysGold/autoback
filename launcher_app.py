@@ -68,6 +68,37 @@ def _hide_from_dock():
         pass
 
 
+def _ensure_stdio():
+    """PyInstaller windowed 模式（console=False）下 sys.stdout/stderr 为 None，
+    uvicorn 的 ColourizedFormatter 在 __init__ 里会调用 sys.stdout.isatty() 报
+    AttributeError。这里给一个真实可写的流兜底：写入用户数据目录下的日志文件，
+    既能让 isatty() 正常返回 False，也方便最终用户排查问题。"""
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        if sys.platform == "win32":
+            base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+            log_dir = Path(base) / "dy_auto_reply" / "logs"
+        elif sys.platform == "darwin":
+            log_dir = Path.home() / "Library" / "Logs" / "dy_auto_reply"
+        else:
+            log_dir = Path.home() / ".cache" / "dy_auto_reply" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "launcher.log"
+        f = open(log_file, "a", encoding="utf-8", buffering=1)
+        if sys.stdout is None:
+            sys.stdout = f
+        if sys.stderr is None:
+            sys.stderr = f
+    except Exception:
+        # 最后兜底：丢到 devnull，至少保证 isatty 可调用
+        devnull = open(os.devnull, "w", encoding="utf-8", buffering=1)
+        if sys.stdout is None:
+            sys.stdout = devnull
+        if sys.stderr is None:
+            sys.stderr = devnull
+
+
 def _setup_paths():
     """打包模式下：把 _MEIPASS 加入 sys.path 让现有 import 都能 work；
     切换 cwd 到用户数据目录，让所有相对路径自然指向应用支持目录。"""
@@ -91,21 +122,51 @@ def _setup_paths():
         sys.path.insert(0, str(root))
 
 
+_ensure_stdio()
 _setup_paths()
 
 from shared.app_paths import APP_DATA, ensure_data_dirs, chdir_to_data, is_frozen  # noqa: E402
 
 
-def _ensure_chromium():
-    """检查 Playwright Chromium 是否已下载，没有就调 playwright driver 拉一次"""
-    pw_path = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
-                   or (Path.home() / "Library" / "Caches" / "ms-playwright"))
-    if pw_path.exists():
-        # 检查是否有任意 chromium 版本目录
-        if any(p.is_dir() and p.name.startswith("chromium-") for p in pw_path.iterdir()):
-            return  # 已装
+def _expected_chromium_exe() -> Path | None:
+    """读 playwright 自带的 browsers.json，拿到当前 playwright 版本期望的 Chromium
+    构建号，返回其 chrome.exe / chrome / Chromium 可执行文件预期路径。
 
-    print("[launcher] First run: downloading Chromium (~150 MB), please wait...")
+    早期写法只检查 `chromium-*` 目录是否存在，会被旧版本残留蒙混过关
+    （如 1.58 期望 chromium-1208，但本机有 chromium-1200，导致 launch 时
+    报 "Executable doesn't exist"）。"""
+    try:
+        import json, playwright
+        pw_root = Path(playwright.__file__).parent
+        browsers_json = pw_root / "driver" / "package" / "browsers.json"
+        if not browsers_json.exists():
+            return None
+        data = json.loads(browsers_json.read_text(encoding="utf-8"))
+        rev = next((b["revision"] for b in data.get("browsers", [])
+                    if b.get("name") == "chromium"), None)
+        if not rev:
+            return None
+        pw_path = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+                       or (Path.home() / "AppData" / "Local" / "ms-playwright"))
+        base = pw_path / f"chromium-{rev}"
+        if sys.platform == "win32":
+            return base / "chrome-win64" / "chrome.exe"
+        if sys.platform == "darwin":
+            return base / "chrome-mac" / "Chromium.app" / "Contents" / "MacOS" / "Chromium"
+        return base / "chrome-linux" / "chrome"
+    except Exception:
+        return None
+
+
+def _ensure_chromium():
+    """检查 Playwright Chromium 是否已下载且版本匹配，否则调 driver 拉一次"""
+    expected = _expected_chromium_exe()
+    if expected is not None and expected.exists():
+        return  # 当前 playwright 版本对应的 chromium 已装
+
+    pw_path = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+                   or (Path.home() / "AppData" / "Local" / "ms-playwright"))
+    print("[launcher] Downloading matching Chromium (~150 MB), please wait...")
     try:
         from playwright._impl._driver import compute_driver_executable, get_driver_env
         node_exe, cli_js = compute_driver_executable()
