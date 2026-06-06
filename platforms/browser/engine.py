@@ -77,7 +77,7 @@ class BrowserEngine:
             "--disable-blink-features=AutomationControlled",
             "--no-first-run",
             "--no-default-browser-check",
-            # 远程桌面 / VPS / 无独显的机器上，headed Chromium 的 GPU 合成会失败，
+            # 远程桌面 / VPS / 无独显 / 虚拟机上，headed Chromium 的 GPU 合成会失败，
             # 表现为窗口能弹出但客户端区域全黑（扫码页加载不出来）。
             # 强制走软件渲染即可解决，对正常有显卡的机器也无副作用。
             "--disable-gpu",

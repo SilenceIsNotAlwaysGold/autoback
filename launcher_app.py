@@ -172,8 +172,22 @@ def _ensure_chromium():
         node_exe, cli_js = compute_driver_executable()
         env = get_driver_env()
         env["PLAYWRIGHT_BROWSERS_PATH"] = str(pw_path)
+        # 国内默认走官方海外 CDN 极易超时/卡死（表现为内核一直下不下来）。
+        # 没有显式配置时，默认用 npmmirror 国内镜像，用户可用环境变量覆盖。
+        env.setdefault("PLAYWRIGHT_DOWNLOAD_HOST",
+                       "https://cdn.npmmirror.com/binaries/playwright")
         cmd = [str(node_exe), str(cli_js), "install", "chromium"]
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        # windowed（无控制台）打包 exe 直接 shell 出 node.exe 时，Windows 会凭空
+        # 分配一个空的黑色控制台窗口（标题为 ...\driver\node.exe），下载内核期间
+        # 一直挂着，用户误以为是"黑屏卡死"。这里显式隐藏该子进程窗口。
+        run_kwargs = {}
+        if sys.platform == "win32":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
+            run_kwargs["startupinfo"] = si
+            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True, **run_kwargs)
         if result.returncode == 0:
             print("[launcher] Chromium installed successfully")
         else:
