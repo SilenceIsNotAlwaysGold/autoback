@@ -119,6 +119,23 @@ class BrowserEngine:
                              self.platform, self.account_name, self.proxy_url, e)
                 proxy = None
                 self._proxy_bridge = None
+                # 用户明确配了代理却没能设置成功 → 绝不能裸本机 IP 启动浏览器
+                # （否则多账号会用同一真实 IP，被风控关联）。直接中止。
+                raise RuntimeError(
+                    f"代理已配置但初始化失败，已中止启动以避免本机 IP 泄漏：{e}"
+                ) from e
+
+        # 最后防线：配了代理但 proxy 仍为空，绝不裸奔
+        if self.proxy_url and not proxy:
+            raise RuntimeError("代理已配置但未生效，已中止启动以避免本机 IP 泄漏")
+
+        # 走代理时防 WebRTC 把本机真实 IP 暴露给页面（抖音可借此关联多账号）。
+        # disable_non_proxied_udp：WebRTC 只允许走代理通道，禁掉直连 UDP。
+        if proxy:
+            chrome_args += [
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+            ]
 
         self.context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir),

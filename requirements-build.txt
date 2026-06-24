@@ -7,7 +7,7 @@ starlette==1.0.0
 h11==0.16.0
 anyio==4.13.0
 
-httpx==0.28.1
+httpx[socks]==0.28.1
 PyYAML==6.0.3
 playwright==1.58.0
 python-socks==2.8.1

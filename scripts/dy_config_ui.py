@@ -223,11 +223,16 @@ def api_save_accounts(payload: AccountsPayload):
         if not n or any(c in n for c in '/\\:*?"<>|'):
             raise HTTPException(status_code=400, detail=f"非法账号名：{n}")
     cfg = load_config()
-    cfg["accounts"] = [
+    from shared.proxy_utils import normalize_proxy
+    accounts = []
+    for a in payload.accounts:
         # 去掉空字段，保持 YAML 干净
-        {k: v for k, v in a.model_dump().items() if v not in ("", None)}
-        for a in payload.accounts
-    ]
+        d = {k: v for k, v in a.model_dump().items() if v not in ("", None)}
+        # 代理统一归一化：用户粘贴的任意格式 → 标准 scheme://user:pass@ip:port
+        if d.get("proxy_url"):
+            d["proxy_url"] = normalize_proxy(d["proxy_url"])
+        accounts.append(d)
+    cfg["accounts"] = accounts
     save_config(cfg)
     return {"ok": True, "count": len(cfg["accounts"])}
 
@@ -278,44 +283,65 @@ def _spawn_login(name: str, acc: dict) -> tuple[bool, str, int]:
         return False, str(e), 0
 
 
+@app.post("/api/proxy/normalize")
+def api_normalize_proxy(payload: dict):
+    """纯解析清洗代理格式（不联网，秒回）。
+
+    用户粘贴的任意格式（IP|端口|账号|密码|到期日 等）→ 标准 URL。
+    用于输入框失焦时即时整理，不需要等联网测试。
+
+    Request:  {"proxy_url": "182.40.197.72|14081|luckly579|luckly579|2026-04-17"}
+    Response: {"ok": true, "proxy_url": "socks5://...@ip:port", "changed": true,
+               "parsed": {host, port, username, ...}}
+    """
+    from shared.proxy_utils import normalize_proxy, parse_proxy
+    raw = (payload.get("proxy_url") or "").strip()
+    if not raw:
+        return {"ok": False, "proxy_url": "", "changed": False, "message": "空"}
+    parts = parse_proxy(raw)
+    norm = normalize_proxy(raw)
+    if not parts:
+        # 解析不出来，原样返回，不破坏用户输入
+        return {"ok": False, "proxy_url": raw, "changed": False,
+                "message": "无法识别格式，请检查"}
+    # 不回显明文密码
+    safe = dict(parts)
+    if safe.get("password"):
+        safe["password"] = "***"
+    return {"ok": True, "proxy_url": norm, "changed": norm != raw, "parsed": safe}
+
+
 @app.post("/api/proxy/test")
 def api_test_proxy(payload: dict):
-    """测试代理是否可用：通过代理访问 httpbin.org/ip 返回出口 IP
+    """测试代理是否可用，并智能识别类型（socks5 / http）。
 
-    Request: {"proxy_url": "http://user:pass@ip:port"}
-    Response: {"ok": true, "ip": "...", "latency_ms": 234} 或错误
+    支持直接粘贴各种格式（竖线 ip|port|user|pass|到期日、ip:port:user:pass、
+    标准 URL 等），自动解析归一化，再实际连一次判定 socks5 还是 http。
+
+    Request:  {"proxy_url": "182.40.197.72|14081|luckly579|luckly579|2026-04-17"}
+    Response: {"ok": true, "ip": "...", "latency_ms": 234,
+               "scheme": "socks5", "normalized": "socks5://...@ip:port"} 或错误
     """
-    import time as _t
-    import httpx
-    proxy_url = (payload.get("proxy_url") or "").strip()
-    if not proxy_url:
+    from shared.proxy_utils import detect_scheme
+    raw = (payload.get("proxy_url") or "").strip()
+    if not raw:
         return {"ok": False, "message": "未配置代理（将走本机 IP）"}
-    # 多个探测地址，任一成功即可（国内环境 ipify/httpbin 时常超时）
-    probes = [
-        ("http://ip-api.com/json/", lambda j: j.get("query")),
-        ("https://ip.useragentinfo.com/json", lambda j: j.get("ip")),
-        ("http://httpbin.org/ip", lambda j: j.get("origin", "").split(",")[0].strip()),
-        ("https://api.ipify.org?format=json", lambda j: j.get("ip")),
-    ]
-    last_err = None
-    t0 = _t.monotonic()
-    for url, parser in probes:
-        try:
-            with httpx.Client(proxy=proxy_url, timeout=6, verify=False) as client:
-                resp = client.get(url)
-                resp.raise_for_status()
-                ip = parser(resp.json())
-                if ip:
-                    ms = int((_t.monotonic() - t0) * 1000)
-                    return {
-                        "ok": True, "ip": ip, "latency_ms": ms,
-                        "proxy": proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url,
-                        "probe": url,
-                    }
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            continue
-    return {"ok": False, "message": f"所有探测点均失败。最后错误：{last_err}"}
+
+    r = detect_scheme(raw)
+    if not r.get("ok"):
+        return {"ok": False, "message": r.get("message", "代理不可用")}
+
+    url = r["url"]
+    return {
+        "ok": True,
+        "ip": r["ip"],
+        "latency_ms": r.get("latency_ms"),
+        "scheme": r["scheme"],
+        "normalized": url,                       # 前端可回写，统一存标准 URL
+        "proxy": url.split("@")[-1] if "@" in url else url,
+        "message": r.get("message"),
+    }
+
 
 
 class BulkProxyPayload(BaseModel):
@@ -324,10 +350,11 @@ class BulkProxyPayload(BaseModel):
 
 @app.post("/api/accounts/bulk-proxy")
 def api_bulk_proxy(payload: BulkProxyPayload):
-    """批量把代理列表分配给账号（按顺序）"""
+    """批量把代理列表分配给账号（按顺序），每行自动解析归一化"""
+    from shared.proxy_utils import normalize_proxy
     cfg = load_config()
     accs = cfg.get("accounts", [])
-    proxies = [p.strip() for p in payload.proxies if p.strip()]
+    proxies = [normalize_proxy(p) for p in payload.proxies if p.strip()]
     updated = 0
     for i, acc in enumerate(accs):
         if i >= len(proxies):
@@ -874,9 +901,13 @@ function accountHTML(a, i) {
     <div class="field">
       <div class="field-label">
         代理 URL（可选，留空=本机 IP）
-        <button class="small" style="margin-left:8px;background:#10b981;color:white;padding:2px 8px;font-size:11px" onclick="testProxy(${i})">🧪 测试</button>
+        <button class="small" style="margin-left:8px;background:#6366f1;color:white;padding:2px 8px;font-size:11px" onclick="cleanProxy(${i})">✨ 整理格式</button>
+        <button class="small" style="margin-left:4px;background:#10b981;color:white;padding:2px 8px;font-size:11px" onclick="testProxy(${i})">🧪 测试连通</button>
       </div>
-      <input type="text" value="${esc(a.proxy_url)}" oninput="updateAcc(${i},'proxy_url',this.value)" placeholder="socks5://用户名:密码@IP:端口 或 http://...">
+      <input id="proxy-inp-${i}" type="text" value="${esc(a.proxy_url)}" oninput="updateAcc(${i},'proxy_url',this.value)" onblur="cleanProxy(${i})" placeholder="直接粘贴：182.40.197.72|14081|用户名|密码|到期日（失焦自动整理）">
+      <div style="font-size:11px;color:var(--muted);margin-top:3px">
+        直接粘贴购买的代理（IP|端口|账号|密码|到期日），离开输入框会自动整理成标准格式；点"测试连通"还会联网识别 socks5/http。
+      </div>
     </div>
     <div class="field" style="${a.bitbrowser_id ? '' : 'display:none'}" id="bb-${i}">
       <div class="field-label">
@@ -982,6 +1013,29 @@ async function loginAccount(i) {
   }
 }
 
+async function cleanProxy(i) {
+  const acc = accounts[i];
+  const raw = (acc.proxy_url || '').trim();
+  if (!raw) return;
+  let r;
+  try {
+    r = await fetch('/api/proxy/normalize', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ proxy_url: raw }),
+    }).then(r => r.json());
+  } catch (e) { return; }
+  if (r.ok && r.proxy_url) {
+    acc.proxy_url = r.proxy_url;
+    // 只更新这一个输入框，避免整列表重渲染丢失其它展开状态
+    const inp = document.getElementById('proxy-inp-' + i);
+    if (inp) inp.value = r.proxy_url;
+    if (r.changed) toast('✨ 已整理为标准格式：\n' + r.proxy_url);
+  } else if (!r.ok && r.message && raw.length > 3) {
+    // 解析失败给个轻提示，但不强行清空用户输入
+    toast('⚠ 代理格式无法识别，请检查：' + raw);
+  }
+}
+
 async function testProxy(i) {
   const acc = accounts[i];
   const proxy = acc.proxy_url || '';
@@ -990,21 +1044,32 @@ async function testProxy(i) {
     return;
   }
   // 提示测试中
-  toast('🧪 正在测试 ' + acc.name + ' 的代理...');
+  toast('🧪 正在测试并识别 ' + acc.name + ' 的代理类型...');
   const r = await fetch('/api/proxy/test', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ proxy_url: proxy }),
   }).then(r => r.json());
   if (r.ok) {
-    toast(`✅ ${acc.name} 代理正常\n出口 IP: ${r.ip}\n延迟 ${r.latency_ms}ms`);
+    // 把识别归一化后的标准 URL 回填，并立即保存
+    let changed = false;
+    if (r.normalized && r.normalized !== acc.proxy_url) {
+      acc.proxy_url = r.normalized;
+      changed = true;
+      renderAccounts();
+    }
+    const tag = r.scheme ? `（类型：${r.scheme.toUpperCase()}）` : '';
+    toast(`✅ ${acc.name} 代理正常 ${tag}\n出口 IP: ${r.ip}\n延迟 ${r.latency_ms}ms` +
+          (changed ? '\n已自动回填标准格式，记得点保存' : ''));
   } else {
-    alert(`❌ ${acc.name} 代理失败\n\n${r.message}\n\n检查格式是否为 http://用户名:密码@IP:端口`);
+    alert(`❌ ${acc.name} 代理失败\n\n${r.message}\n\n` +
+          `可直接粘贴购买格式：IP|端口|账号|密码|到期日\n` +
+          `或标准 URL：socks5://账号:密码@IP:端口`);
   }
 }
 
 function showBulkProxy() {
   const lines = accounts.map((a, i) => `# ${i+1}. ${a.name}: ${a.proxy_url || '（空）'}`).join('\n');
-  const example = `请每行粘一个代理，按顺序对应 ${accounts.length} 个账号：\n\nhttp://user1:pass1@ip1:port\nhttp://user2:pass2@ip2:port\n...\n\n当前状态:\n${lines}`;
+  const example = `请每行粘一个代理，按顺序对应 ${accounts.length} 个账号：\n\n182.40.197.72|14081|账号|密码|到期日\n或 socks5://账号:密码@IP:端口\n（自动识别格式与类型）\n...\n\n当前状态:\n${lines}`;
   const input = prompt(example, '');
   if (!input) return;
   const proxies = input.split(/\\n|,/).map(s => s.trim()).filter(Boolean);

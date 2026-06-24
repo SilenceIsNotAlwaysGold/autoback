@@ -42,8 +42,10 @@ hiddenimports = [
 
     "yaml", "sqlite3", "httpx", "httpcore",
     "python_socks", "python_socks.async_", "python_socks.async_.asyncio",
+    # httpx 走 socks5 代理预检必需，否则配 SOCKS5 的账号代理测试/预检 ImportError
+    "socksio",
 
-    "shared", "shared.app_paths", "shared.rules", "shared.rules.engine",
+    "shared", "shared.app_paths", "shared.proxy_utils", "shared.rules", "shared.rules.engine",
     "shared.ai", "shared.ai.agent", "shared.conversation",
     "shared.conversation.memory",
     "scripts", "scripts.dy_auto_reply", "scripts.dy_config_ui",

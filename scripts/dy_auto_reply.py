@@ -196,7 +196,8 @@ class AccountRunner:
         return True
 
     async def setup(self) -> bool:
-        proxy_url = self.cfg.get("proxy_url", "") or ""
+        from shared.proxy_utils import normalize_proxy
+        proxy_url = normalize_proxy(self.cfg.get("proxy_url", "") or "")
         bitbrowser_id = self.cfg.get("bitbrowser_id", "") or ""
         headless = self.shared.get("browser", {}).get("headless", False)
 
@@ -251,7 +252,8 @@ class AccountRunner:
 
     async def login_interactive(self):
         """首次交互式登录：弹浏览器等扫码"""
-        proxy_url = self.cfg.get("proxy_url", "") or ""
+        from shared.proxy_utils import normalize_proxy
+        proxy_url = normalize_proxy(self.cfg.get("proxy_url", "") or "")
         bitbrowser_id = self.cfg.get("bitbrowser_id", "") or ""
 
         # 代理预检：登录前 httpx 先试一下，代理不通就别浪费 Chromium 启动时间
