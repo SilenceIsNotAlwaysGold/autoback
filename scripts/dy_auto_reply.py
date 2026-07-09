@@ -161,38 +161,44 @@ class AccountRunner:
         return url
 
     async def _preflight_proxy(self, proxy_url: str) -> bool:
-        """用 httpx 快速验证代理：需要同时能走 HTTP 和 HTTPS（抖音是 HTTPS 站）"""
+        """验证代理能否承载到目标站的流量。
+
+        抖音是 HTTPS 站 → HTTPS 能通即可用。HTTP 仅作补充信号，不作硬门槛：
+        探测站（httpbin 等）自身可能 5xx / 限流，但只要请求经代理到达了服务器
+        （拿到任意响应、没抛连接异常），就说明代理隧道是通的。
+        """
         import httpx
         ok_http = ok_https = False
         try:
             with httpx.Client(proxy=proxy_url, timeout=8, verify=False) as c:
-                # HTTP 通路
+                # HTTP 通路：拿到任意响应即算通（503 也说明请求经代理送达了）
                 for url in ("http://ip-api.com/json/", "http://httpbin.org/ip"):
                     try:
-                        if c.get(url).status_code == 200:
-                            ok_http = True
-                            break
+                        c.get(url)
+                        ok_http = True
+                        break
                     except Exception:
                         continue
                 # HTTPS CONNECT 通路（关键：抖音必须用 HTTPS）
                 for url in ("https://creator.douyin.com/", "https://www.baidu.com/"):
                     try:
-                        if c.get(url).status_code < 500:
-                            ok_https = True
-                            break
+                        c.get(url)
+                        ok_https = True
+                        break
                     except Exception:
                         continue
         except Exception as e:
             self._log.error("Proxy preflight error: %s", e)
             return False
 
-        if not ok_http:
-            self._log.error("Proxy 不通 HTTP")
-            return False
+        # HTTPS 是硬门槛（抖音站）；HTTP 失败只告警不拦，避免探测站抽风误伤
         if not ok_https:
             self._log.error("Proxy 不支持 HTTPS CONNECT（抖音是 HTTPS 站，必须支持）")
             return False
-        self._log.info("Proxy OK (HTTP + HTTPS 双通)")
+        if not ok_http:
+            self._log.warning("Proxy HTTPS 已通过；HTTP 探测点无响应（多为探测站故障），放行")
+        else:
+            self._log.info("Proxy OK (HTTP + HTTPS 双通)")
         return True
 
     async def setup(self) -> bool:

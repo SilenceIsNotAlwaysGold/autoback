@@ -159,42 +159,68 @@ def _expected_chromium_exe() -> Path | None:
 
 
 def _ensure_chromium():
-    """检查 Playwright Chromium 是否已下载且版本匹配，否则调 driver 拉一次"""
+    """检查 Playwright Chromium 是否已下载且版本匹配，否则调 driver 拉一次。
+
+    多源回退下载：镜像可能缺某个具体版本（如 145.0.7632.6，同步滞后会 404），
+    官方源虽慢但版本最全。依次尝试，任一成功即停。用户可用环境变量
+    PLAYWRIGHT_DOWNLOAD_HOST 指定优先源（会插到最前）。
+    """
     expected = _expected_chromium_exe()
     if expected is not None and expected.exists():
         return  # 当前 playwright 版本对应的 chromium 已装
 
     pw_path = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
                    or (Path.home() / "AppData" / "Local" / "ms-playwright"))
-    print("[launcher] Downloading matching Chromium (~150 MB), please wait...")
+
+    # 下载源候选：(标签, host)。host=None 表示用 playwright 官方默认源。
+    # 顺序：国内镜像优先（快），失败再回退官方源（版本最全）。
+    hosts: list[tuple[str, str | None]] = [
+        ("npmmirror 国内镜像", "https://cdn.npmmirror.com/binaries/playwright"),
+        ("官方源", None),
+    ]
+    # 用户显式指定的源插到最前
+    user_host = os.environ.get("PLAYWRIGHT_DOWNLOAD_HOST", "").strip()
+    if user_host:
+        hosts.insert(0, ("自定义源", user_host))
+
+    # 隐藏 node.exe 幽灵控制台窗口（windowed 打包 exe 会凭空弹黑框）
+    run_kwargs = {}
+    if sys.platform == "win32":
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        run_kwargs["startupinfo"] = si
+        run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
     try:
         from playwright._impl._driver import compute_driver_executable, get_driver_env
         node_exe, cli_js = compute_driver_executable()
-        env = get_driver_env()
-        env["PLAYWRIGHT_BROWSERS_PATH"] = str(pw_path)
-        # 国内默认走官方海外 CDN 极易超时/卡死（表现为内核一直下不下来）。
-        # 没有显式配置时，默认用 npmmirror 国内镜像，用户可用环境变量覆盖。
-        env.setdefault("PLAYWRIGHT_DOWNLOAD_HOST",
-                       "https://cdn.npmmirror.com/binaries/playwright")
         cmd = [str(node_exe), str(cli_js), "install", "chromium"]
-        # windowed（无控制台）打包 exe 直接 shell 出 node.exe 时，Windows 会凭空
-        # 分配一个空的黑色控制台窗口（标题为 ...\driver\node.exe），下载内核期间
-        # 一直挂着，用户误以为是"黑屏卡死"。这里显式隐藏该子进程窗口。
-        run_kwargs = {}
-        if sys.platform == "win32":
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            si.wShowWindow = subprocess.SW_HIDE
-            run_kwargs["startupinfo"] = si
-            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True, **run_kwargs)
-        if result.returncode == 0:
-            print("[launcher] Chromium installed successfully")
-        else:
-            print(f"[launcher] Chromium install failed (exit={result.returncode})")
-            print(result.stderr[-500:] if result.stderr else "")
     except Exception as e:
         print(f"[launcher] chromium install error: {e}")
+        return
+
+    for label, host in hosts:
+        env = get_driver_env()
+        env["PLAYWRIGHT_BROWSERS_PATH"] = str(pw_path)
+        if host:
+            env["PLAYWRIGHT_DOWNLOAD_HOST"] = host
+        else:
+            env.pop("PLAYWRIGHT_DOWNLOAD_HOST", None)
+        print(f"[launcher] Downloading Chromium (~150 MB) via {label} ...")
+        try:
+            result = subprocess.run(cmd, env=env, capture_output=True, text=True, **run_kwargs)
+        except Exception as e:
+            print(f"[launcher] {label} 下载异常: {e}")
+            continue
+        # 成功判定：退出码 0 且目标 chromium 确实落地
+        if result.returncode == 0 and (expected is None or expected.exists()):
+            print(f"[launcher] Chromium installed via {label}")
+            return
+        tail = (result.stderr or result.stdout or "")[-400:]
+        print(f"[launcher] {label} 失败 (exit={result.returncode})，尝试下一个源。{tail}")
+
+    print("[launcher] 所有下载源均失败，请检查网络后重试（或手动设置 PLAYWRIGHT_DOWNLOAD_HOST）")
 
 
 def _open_browser_later(url: str, delay: float = 1.5):
