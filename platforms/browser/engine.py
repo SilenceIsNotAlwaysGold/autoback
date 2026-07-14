@@ -13,11 +13,20 @@ import time
 from pathlib import Path
 from typing import Any
 
-from platforms.browser.stealth import STEALTH_FULL, USER_AGENTS, VIEWPORTS
-
 logger = logging.getLogger(__name__)
 
 STATE_BASE_DIR = Path("data/browser_state")
+
+
+def _mask_proxy_url(url: str) -> str:
+    if not url or "@" not in url:
+        return url
+    try:
+        scheme, rest = url.split("://", 1)
+        _, host = rest.rsplit("@", 1)
+        return f"{scheme}://***@{host}"
+    except ValueError:
+        return "***"
 
 
 class BrowserEngine:
@@ -67,10 +76,9 @@ class BrowserEngine:
         profile_dir = Path("data/browser_profiles") / self.platform / self.account_name
         profile_dir.mkdir(parents=True, exist_ok=True)
 
-        # 账号专属指纹（每个账号 UA/视口/指纹 固定且唯一）
+        # 账号专属指纹（稳定视口 + 与宿主系统一致的平台字段）
         from platforms.browser.fingerprint import generate_fingerprint, generate_stealth_script
         fp = generate_fingerprint(self.account_name)
-        ua = USER_AGENTS[hash(self.account_name) % len(USER_AGENTS)]
         vp = {"width": fp["screen_width"], "height": fp["screen_height"]}
 
         chrome_args = [
@@ -116,8 +124,14 @@ class BrowserEngine:
                                 parsed.hostname, parsed.port)
             except Exception as e:
                 logger.error("[%s/%s] Invalid proxy_url %r: %s",
-                             self.platform, self.account_name, self.proxy_url, e)
+                             self.platform, self.account_name,
+                             _mask_proxy_url(self.proxy_url), e)
                 proxy = None
+                if self._proxy_bridge:
+                    try:
+                        await self._proxy_bridge.stop()
+                    except Exception:
+                        pass
                 self._proxy_bridge = None
                 # 用户明确配了代理却没能设置成功 → 绝不能裸本机 IP 启动浏览器
                 # （否则多账号会用同一真实 IP，被风控关联）。直接中止。
@@ -141,7 +155,6 @@ class BrowserEngine:
             user_data_dir=str(profile_dir),
             headless=False,
             viewport=vp,
-            user_agent=ua,
             locale="zh-CN",
             timezone_id="Asia/Shanghai",
             args=chrome_args,
@@ -183,11 +196,19 @@ class BrowserEngine:
             try:
                 if self.browser:
                     await self.browser.close()
+            except Exception:
+                pass
+            try:
+                await self._bitbrowser_client.close_playwright(self.bitbrowser_id)
+            except Exception:
+                pass
+            try:
                 await self._bitbrowser_client.close_window(self.bitbrowser_id)
             except Exception:
                 pass
             elapsed = time.monotonic() - self._start_time if self._start_time else 0
-            self.page = self.context = self.browser = None
+            self.page = self.context = self.browser = self._playwright = None
+            self._bitbrowser_client = None
             logger.info("[%s/%s] BitBrowser stopped (%.1fs)", self.platform, self.account_name, elapsed)
             return
 

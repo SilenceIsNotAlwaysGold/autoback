@@ -4,6 +4,7 @@
   --mode=ui    （默认）启动 FastAPI 配置 UI + 自动开浏览器
   --mode=main  启动主回复脚本（被 UI 通过 subprocess 调起）
   --mode=login --account NAME   交互式登录
+  --mode=check  检查打包运行时和内置 Chromium 后立即退出
 
 打包后单一可执行文件：dy_auto_reply.app/Contents/MacOS/dy_auto_reply
 开发模式：python launcher_app.py [--mode=...]
@@ -73,22 +74,28 @@ def _ensure_stdio():
     uvicorn 的 ColourizedFormatter 在 __init__ 里会调用 sys.stdout.isatty() 报
     AttributeError。这里给一个真实可写的流兜底：写入用户数据目录下的日志文件，
     既能让 isatty() 正常返回 False，也方便最终用户排查问题。"""
-    if sys.stdout is not None and sys.stderr is not None:
+    requested_log = os.environ.get("DY_STDIO_LOG", "").strip()
+    if not requested_log and sys.stdout is not None and sys.stderr is not None:
         return
     try:
-        if sys.platform == "win32":
+        if requested_log:
+            log_file = Path(requested_log)
+            log_dir = log_file.parent
+        elif sys.platform == "win32":
             base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
             log_dir = Path(base) / "dy_auto_reply" / "logs"
+            log_file = log_dir / "launcher.log"
         elif sys.platform == "darwin":
             log_dir = Path.home() / "Library" / "Logs" / "dy_auto_reply"
+            log_file = log_dir / "launcher.log"
         else:
             log_dir = Path.home() / ".cache" / "dy_auto_reply" / "logs"
+            log_file = log_dir / "launcher.log"
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / "launcher.log"
         f = open(log_file, "a", encoding="utf-8", buffering=1)
-        if sys.stdout is None:
+        if requested_log or sys.stdout is None:
             sys.stdout = f
-        if sys.stderr is None:
+        if requested_log or sys.stderr is None:
             sys.stderr = f
     except Exception:
         # 最后兜底：丢到 devnull，至少保证 isatty 可调用
@@ -106,9 +113,11 @@ def _setup_paths():
         meipass = Path(getattr(sys, "_MEIPASS", ""))
         if meipass and str(meipass) not in sys.path:
             sys.path.insert(0, str(meipass))
-        # Playwright 浏览器路径：强制指向用户缓存（默认行为），
-        # 否则 frozen 模式下会去 bundle 内的 .local-browsers 找（不存在）
-        if not os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+        # 自包含 Windows 包优先使用随程序分发的 Chromium，不依赖本机缓存或首次下载。
+        bundled_pw = meipass / "playwright-browsers"
+        if bundled_pw.exists():
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled_pw)
+        elif not os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
             if sys.platform == "darwin":
                 default_pw = Path.home() / "Library" / "Caches" / "ms-playwright"
             elif sys.platform == "win32":
@@ -224,6 +233,9 @@ def _ensure_chromium():
 
 
 def _open_browser_later(url: str, delay: float = 1.5):
+    if os.environ.get("DY_NO_OPEN_BROWSER", "").strip() == "1":
+        return
+
     def _run():
         time.sleep(delay)
         try:
@@ -273,9 +285,37 @@ def run_login(account: str):
     asyncio.run(_main())
 
 
+def run_check():
+    """离线检查 Python/Playwright/内置 Chromium 是否可正常启动。"""
+    ensure_data_dirs(seed_example_config=True)
+    chdir_to_data()
+    _ensure_chromium()
+
+    async def _check():
+        from platforms.browser.engine import BrowserEngine
+
+        engine = BrowserEngine(
+            platform="douyin",
+            account_name="_runtime_check",
+            headless=True,
+        )
+        try:
+            await engine.start()
+            user_agent = await engine.page.evaluate("() => navigator.userAgent")
+            print(f"[launcher] Runtime check OK: {user_agent}")
+        finally:
+            await engine.stop()
+
+    asyncio.run(_check())
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["ui", "main", "login"], default="ui")
+    parser.add_argument(
+        "--mode",
+        choices=["ui", "main", "login", "check"],
+        default="ui",
+    )
     parser.add_argument("--account", default="")
     args, _ = parser.parse_known_args()
 
@@ -283,6 +323,8 @@ def main():
         run_main()
     elif args.mode == "login":
         run_login(args.account)
+    elif args.mode == "check":
+        run_check()
     else:
         run_ui()
 

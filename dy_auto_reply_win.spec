@@ -8,17 +8,67 @@
     dist/dy_auto_reply/dy_auto_reply.exe   ← 主程序（双击运行）
     dist/dy_auto_reply/                    ← 整个目录都需要分发（onedir 模式）
 """
+import json
+import os
 import sys
 from pathlib import Path
 
+import playwright
+
 ROOT = Path(SPECPATH).resolve()
 sys.path.insert(0, str(ROOT))
+
+
+def _bundled_chromium() -> tuple[Path, str]:
+    browsers_json = (
+        Path(playwright.__file__).parent
+        / "driver"
+        / "package"
+        / "browsers.json"
+    )
+    browser_data = json.loads(browsers_json.read_text(encoding="utf-8"))
+    revision = next(
+        item["revision"]
+        for item in browser_data.get("browsers", [])
+        if item.get("name") == "chromium"
+    )
+
+    roots = []
+    env_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if env_root and env_root != "0":
+        roots.append(Path(env_root))
+    roots.append(ROOT / ".playwright-browsers")
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        roots.append(Path(local_app_data) / "ms-playwright")
+
+    for browser_root in roots:
+        chromium_dir = browser_root / f"chromium-{revision}"
+        chrome_exe = chromium_dir / "chrome-win64" / "chrome.exe"
+        if chrome_exe.exists():
+            print(f"Bundling Chromium revision {revision} from {chromium_dir}")
+            return chromium_dir, revision
+
+    searched = "\n  - ".join(str(root) for root in roots)
+    raise RuntimeError(
+        "未找到与当前 Playwright 完全匹配的 Chromium。请先执行：\n"
+        "  set PLAYWRIGHT_BROWSERS_PATH=%CD%\\.playwright-browsers\n"
+        "  python -m playwright install chromium\n"
+        f"已检查：\n  - {searched}"
+    )
+
+
+CHROMIUM_DIR, CHROMIUM_REVISION = _bundled_chromium()
 
 datas = [
     (str(ROOT / "config" / "dy_reply.example.yaml"), "config"),
     (str(ROOT / "shared"), "shared"),
     (str(ROOT / "scripts"), "scripts"),
     (str(ROOT / "platforms"), "platforms"),
+    (
+        str(CHROMIUM_DIR),
+        f"playwright-browsers/chromium-{CHROMIUM_REVISION}",
+    ),
 ]
 
 hiddenimports = [
@@ -46,6 +96,7 @@ hiddenimports = [
     "socksio",
 
     "shared", "shared.app_paths", "shared.proxy_utils", "shared.rules", "shared.rules.engine",
+    "shared.process_lock",
     "shared.ai", "shared.ai.agent", "shared.conversation",
     "shared.conversation.memory",
     "scripts", "scripts.dy_auto_reply", "scripts.dy_config_ui",

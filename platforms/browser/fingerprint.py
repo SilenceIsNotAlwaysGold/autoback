@@ -1,10 +1,10 @@
 """账号级指纹生成器 — 每个账号独立且稳定的浏览器指纹
 
-基于账号名 hash 生成所有指纹参数，同一账号每次启动指纹一致，
-不同账号指纹完全不同，平台无法关联。
+基于账号名的稳定摘要生成指纹参数，同一账号每次启动保持一致，
+不同账号产生稳定差异，同时确保平台字段与当前操作系统一致。
 """
 import hashlib
-import json
+import sys
 
 
 # WebGL Vendor + Renderer 组合（真实设备数据）
@@ -52,6 +52,21 @@ def _seed(account_name: str) -> int:
     return int(hashlib.sha256(account_name.encode()).hexdigest(), 16)
 
 
+def _platform_options() -> list[tuple[str, int]]:
+    """只生成与宿主系统一致的平台字段，避免 UA/平台交叉穿帮。"""
+    if sys.platform == "darwin":
+        return [item for item in PLATFORMS if item[0] == "MacIntel"]
+    if sys.platform == "win32":
+        return [item for item in PLATFORMS if item[0] == "Win32"]
+    return [item for item in PLATFORMS if item[0] == "Linux x86_64"]
+
+
+def _webgl_options() -> list[tuple[str, str]]:
+    if sys.platform == "darwin":
+        return [item for item in WEBGL_CONFIGS if item[0] in ("Intel Inc.", "Apple")]
+    return [item for item in WEBGL_CONFIGS if item[0].startswith("Google Inc.")]
+
+
 def generate_fingerprint(account_name: str) -> dict:
     """为账号生成唯一且稳定的指纹配置
 
@@ -71,8 +86,10 @@ def generate_fingerprint(account_name: str) -> dict:
     """
     seed = _seed(account_name)
 
-    webgl = WEBGL_CONFIGS[seed % len(WEBGL_CONFIGS)]
-    platform = PLATFORMS[(seed >> 8) % len(PLATFORMS)]
+    webgl_options = _webgl_options() or WEBGL_CONFIGS
+    platform_options = _platform_options() or PLATFORMS
+    webgl = webgl_options[seed % len(webgl_options)]
+    platform = platform_options[(seed >> 8) % len(platform_options)]
     memory = MEMORY_OPTIONS[(seed >> 16) % len(MEMORY_OPTIONS)]
     screen = SCREEN_RESOLUTIONS[(seed >> 24) % len(SCREEN_RESOLUTIONS)]
     canvas_noise = 0.01 + (seed % 100) / 1000  # 0.01 ~ 0.11
@@ -94,6 +111,8 @@ def generate_fingerprint(account_name: str) -> dict:
 def generate_stealth_script(account_name: str) -> str:
     """生成账号专属的反检测 JS 脚本"""
     fp = generate_fingerprint(account_name)
+    canvas_seed = _seed(account_name) & 0xFFFFFFFF
+    noise_step = max(1, min(2, round(fp["canvas_noise"] * 16)))
 
     return f"""
 // === 账号专属指纹: {account_name} ===
@@ -143,37 +162,57 @@ window.navigator.permissions.query = (parameters) => (
         : originalQuery(parameters)
 );
 
-// Canvas 指纹噪声（账号专属噪声系数）
+// Canvas 指纹噪声：账号内确定性一致，不修改原始 Canvas
 const _toBlob = HTMLCanvasElement.prototype.toBlob;
 const _toDataURL = HTMLCanvasElement.prototype.toDataURL;
-const NOISE = {fp["canvas_noise"]};
+const FINGERPRINT_SEED = {canvas_seed};
+const NOISE_STEP = {noise_step};
 
-HTMLCanvasElement.prototype.toBlob = function(cb, type, quality) {{
-    const ctx = this.getContext('2d');
-    if (ctx) {{
-        const w = Math.min(this.width, 16);
-        const h = Math.min(this.height, 16);
+function deterministicNoise(index, channel) {{
+    let x = (FINGERPRINT_SEED
+        ^ Math.imul(index + 1, 0x45d9f3b)
+        ^ Math.imul(channel + 1, 0x27d4eb2d)) >>> 0;
+    x = Math.imul(x ^ (x >>> 16), 0x45d9f3b) >>> 0;
+    x = Math.imul(x ^ (x >>> 16), 0x45d9f3b) >>> 0;
+    return ((x ^ (x >>> 16)) % 3) - 1;
+}}
+
+function noisyCanvas(source) {{
+    try {{
+        const clone = document.createElement('canvas');
+        clone.width = source.width;
+        clone.height = source.height;
+        const ctx = clone.getContext('2d');
+        if (!ctx) return source;
+        ctx.drawImage(source, 0, 0);
+        const w = Math.min(clone.width, 16);
+        const h = Math.min(clone.height, 16);
+        if (!w || !h) return clone;
         const imageData = ctx.getImageData(0, 0, w, h);
         for (let i = 0; i < imageData.data.length; i += 4) {{
-            imageData.data[i] = Math.max(0, Math.min(255, imageData.data[i] + Math.floor((Math.random() - 0.5) * NOISE * 255)));
+            imageData.data[i] = Math.max(0, Math.min(
+                255, imageData.data[i] + deterministicNoise(i, 0) * NOISE_STEP
+            ));
+            imageData.data[i + 1] = Math.max(0, Math.min(
+                255, imageData.data[i + 1] + deterministicNoise(i, 1) * NOISE_STEP
+            ));
+            imageData.data[i + 2] = Math.max(0, Math.min(
+                255, imageData.data[i + 2] + deterministicNoise(i, 2) * NOISE_STEP
+            ));
         }}
         ctx.putImageData(imageData, 0, 0);
+        return clone;
+    }} catch (_) {{
+        return source;
     }}
-    return _toBlob.call(this, cb, type, quality);
+}}
+
+HTMLCanvasElement.prototype.toBlob = function(cb, type, quality) {{
+    return _toBlob.call(noisyCanvas(this), cb, type, quality);
 }};
 
 HTMLCanvasElement.prototype.toDataURL = function(type, quality) {{
-    const ctx = this.getContext('2d');
-    if (ctx) {{
-        const w = Math.min(this.width, 16);
-        const h = Math.min(this.height, 16);
-        const imageData = ctx.getImageData(0, 0, w, h);
-        for (let i = 0; i < imageData.data.length; i += 4) {{
-            imageData.data[i] = Math.max(0, Math.min(255, imageData.data[i] + Math.floor((Math.random() - 0.5) * NOISE * 255)));
-        }}
-        ctx.putImageData(imageData, 0, 0);
-    }}
-    return _toDataURL.call(this, type, quality);
+    return _toDataURL.call(noisyCanvas(this), type, quality);
 }};
 
 // WebGL 指纹（账号专属）

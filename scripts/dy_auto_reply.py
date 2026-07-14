@@ -32,6 +32,7 @@ import logging
 import signal
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import yaml
@@ -88,6 +89,19 @@ async def ensure_login(engine: BrowserEngine, timeout: int, prompt_scan: bool) -
     await asyncio.sleep(3)
     if await _check_login(engine):
         return True
+
+    # DOM 改版时视觉选择器可能全部失效；关键登录 Cookie 存在且未跳转登录页时兜底放行。
+    try:
+        url_now = engine.page.url if engine.page else ""
+        if not any(ind in url_now for ind in S.LOGIN_INDICATORS):
+            cookies = await engine.context.cookies()
+            key_names = {"sessionid", "sessionid_ss", "sid_tt"}
+            if any(c.get("name") in key_names and c.get("value") for c in cookies):
+                logger.info("Login DOM check missed, valid login cookie found")
+                return True
+    except Exception as e:
+        logger.debug("cookie login check failed: %s", e)
+
     if not prompt_scan:
         return False
     logger.info("Not logged in, clicking login button...")
@@ -101,7 +115,7 @@ async def ensure_login(engine: BrowserEngine, timeout: int, prompt_scan: bool) -
         logger.info("Timeout but checking cookies as fallback...")
         try:
             cookies = await engine.context.cookies()
-            key_names = {"sessionid", "sessionid_ss", "sid_tt", "passport_csrf_token"}
+            key_names = {"sessionid", "sessionid_ss", "sid_tt"}
             found = [c["name"] for c in cookies if c["name"] in key_names]
             url_now = engine.page.url if engine.page else "?"
             logger.info("Current URL=%s, cookies matched=%s", url_now, found)
@@ -138,6 +152,7 @@ class AccountRunner:
         self.dry_run = dry_run
         self._stop = asyncio.Event()
         self._page_lock = asyncio.Lock()  # 同账号内 pm/comment 不能同时操作 page
+        self._realtime_ready = asyncio.Event()
 
         self.engine: BrowserEngine | None = None
         self.messenger: DouyinMessenger | None = None
@@ -159,6 +174,42 @@ class AccountRunner:
         except Exception:
             pass
         return url
+
+    def _load_live_rules(self, target=None) -> list[dict]:
+        """读取最新回复规则，并把模式开关注入消息/评论处理器。"""
+        cfg_path = Path(self.shared.get("_config_path", "config/dy_reply.yaml"))
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                live_cfg = yaml.safe_load(f) or {}
+        except Exception as e:
+            self._log.warning("读取实时规则失败，继续使用启动配置: %s", e)
+            live_cfg = self.shared
+
+        if "keyword_enabled" in live_cfg or "brainless_enabled" in live_cfg:
+            keyword_enabled = bool(live_cfg.get("keyword_enabled", True))
+            brainless_enabled = bool(live_cfg.get("brainless_enabled", False))
+        else:
+            old_mode = live_cfg.get("reply_mode", "keyword")
+            keyword_enabled = old_mode == "keyword"
+            brainless_enabled = old_mode == "brainless"
+
+        if target is not None:
+            target._account_config["_keyword_enabled"] = keyword_enabled
+            target._account_config["_brainless_enabled"] = brainless_enabled
+            target._account_config["_brainless_replies"] = live_cfg.get(
+                "brainless_reply_texts", []
+            )
+            target._account_config["_user_reply_cooldown_sec"] = int(
+                live_cfg.get("user_reply_cooldown_sec", 30)
+            )
+        return live_cfg.get("rules", [])
+
+    @asynccontextmanager
+    async def _browser_operation(self):
+        """只在实际操作页面时占用全局并发名额和账号页面锁。"""
+        async with self._page_lock:
+            async with self.op_sem:
+                yield
 
     async def _preflight_proxy(self, proxy_url: str) -> bool:
         """验证代理能否承载到目标站的流量。
@@ -307,49 +358,30 @@ class AccountRunner:
         max_round = cfg.get("max_replies_per_round", 20)
         cap = cfg.get("max_per_day", 200)
 
-        # rules 从 YAML 热读（配置 UI 改后无需重启主脚本）
-        import yaml as _yaml
-        cfg_path = Path(self.shared.get("_config_path", "config/dy_reply.yaml"))
         def rules_provider():
-            try:
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    c = _yaml.safe_load(f) or {}
-                # 兼容旧字段：reply_mode 只在没有新字段时才生效
-                if "keyword_enabled" in c or "brainless_enabled" in c:
-                    kw = bool(c.get("keyword_enabled", True))
-                    br = bool(c.get("brainless_enabled", False))
-                else:
-                    old = c.get("reply_mode", "keyword")
-                    kw = (old == "keyword")
-                    br = (old == "brainless")
-                if self.messenger:
-                    self.messenger._account_config["_keyword_enabled"] = kw
-                    self.messenger._account_config["_brainless_enabled"] = br
-                    self.messenger._account_config["_brainless_replies"] = c.get("brainless_reply_texts", [])
-                    # 用户级回复冷却（秒），跨重启持久。默认 30s
-                    self.messenger._account_config["_user_reply_cooldown_sec"] = int(c.get("user_reply_cooldown_sec", 30))
-                return c.get("rules", [])
-            except Exception:
-                return self.shared.get("rules", [])
+            return self._load_live_rules(self.messenger)
 
         if mode == "realtime":
             self._log.info("[pm] Mode: realtime (MutationObserver)")
-            async with self.op_sem, self._page_lock:
-                try:
-                    await self.messenger.run_realtime(
-                        rules_provider=rules_provider,
-                        ai_agent=self.ai,
-                        store=self.store,
-                        account_name=self.name,
-                        dry_run=self.dry_run,
-                        skip_groups=cfg.get("skip_groups", True),
-                        max_per_day=cap,
-                        max_replies_per_round=max_round,
-                        stop_event=self._stop,
-                        heartbeat_sec=cfg.get("heartbeat_sec", 300),
-                    )
-                except Exception as e:
-                    self._log.error("[pm/realtime] error: %s", e, exc_info=True)
+            try:
+                await self.messenger.run_realtime(
+                    rules_provider=rules_provider,
+                    ai_agent=self.ai,
+                    store=self.store,
+                    account_name=self.name,
+                    dry_run=self.dry_run,
+                    skip_groups=cfg.get("skip_groups", True),
+                    max_per_day=cap,
+                    max_replies_per_round=max_round,
+                    stop_event=self._stop,
+                    heartbeat_sec=cfg.get("heartbeat_sec", 300),
+                    operation_guard=self._browser_operation,
+                    ready_event=self._realtime_ready,
+                )
+            except Exception as e:
+                self._log.error("[pm/realtime] error: %s", e, exc_info=True)
+            finally:
+                self._realtime_ready.set()
             return
 
         # 轮询模式（兼容旧行为）
@@ -359,10 +391,13 @@ class AccountRunner:
                 today = self.store.today_reply_count(self.name, "pm")
                 if today >= cap:
                     self._log.warning("[pm] daily cap %d reached, sleep 1h", cap)
-                    await asyncio.wait_for(self._stop.wait(), timeout=3600)
+                    try:
+                        await asyncio.wait_for(self._stop.wait(), timeout=3600)
+                    except asyncio.TimeoutError:
+                        pass
                     continue
 
-                async with self.op_sem, self._page_lock:
+                async with self._browser_operation():
                     await self.messenger.auto_reply_loop(
                         rules=rules_provider(),
                         max_replies=min(max_round, cap - today),
@@ -384,30 +419,38 @@ class AccountRunner:
         cfg = self.shared.get("commenter", {})
         if not cfg.get("enabled"):
             return
+        messenger_cfg = self.shared.get("messenger", {})
+        if messenger_cfg.get("enabled") and messenger_cfg.get("mode", "realtime") == "realtime":
+            await self._realtime_ready.wait()
         interval = cfg.get("poll_interval", 120)
         max_round = cfg.get("max_replies_per_round", 30)
         cap = cfg.get("max_per_day", 300)
         delay = tuple(cfg.get("per_reply_delay", [5, 15]))
-        rules = self.shared.get("rules", [])
-
         while not self._stop.is_set():
             try:
                 today = self.store.today_reply_count(self.name, "comment")
                 if today >= cap:
                     self._log.warning("[comment] daily cap %d reached, sleep 1h", cap)
-                    await asyncio.wait_for(self._stop.wait(), timeout=3600)
+                    try:
+                        await asyncio.wait_for(self._stop.wait(), timeout=3600)
+                    except asyncio.TimeoutError:
+                        pass
                     continue
 
-                async with self.op_sem, self._page_lock:
-                    await self.commenter.auto_reply_loop(
-                        rules=rules,
-                        ai_agent=self.ai,
-                        store=self.store,
-                        account_name=self.name,
-                        max_replies=min(max_round, cap - today),
-                        per_reply_delay=delay,
-                        dry_run=self.dry_run,
-                    )
+                try:
+                    async with self._browser_operation():
+                        await self.commenter.auto_reply_loop(
+                            rules=self._load_live_rules(self.commenter),
+                            ai_agent=self.ai,
+                            store=self.store,
+                            account_name=self.name,
+                            max_replies=min(max_round, cap - today),
+                            per_reply_delay=delay,
+                            dry_run=self.dry_run,
+                        )
+                finally:
+                    if self.messenger:
+                        self.messenger.notify_page_changed()
             except Exception as e:
                 self._log.error("[comment] loop error: %s", e, exc_info=True)
 
@@ -417,20 +460,28 @@ class AccountRunner:
                 pass
 
     async def run(self):
-        if not await self.setup():
-            return
         try:
+            if not await self.setup():
+                return
             await asyncio.gather(self._run_messenger(), self._run_commenter())
         finally:
             await self.teardown()
 
     async def teardown(self):
+        engine = self.engine
+        self.engine = None
+        if not engine:
+            return
         try:
-            if self.engine:
-                await self.engine.save_state()
-                await self.engine.stop()
+            if engine.context:
+                await engine.save_state()
         except Exception as e:
-            self._log.warning("teardown error: %s", e)
+            self._log.warning("save state during teardown failed: %s", e)
+        finally:
+            try:
+                await engine.stop()
+            except Exception as e:
+                self._log.warning("browser stop during teardown failed: %s", e)
 
     def request_stop(self):
         self._stop.set()
@@ -638,11 +689,11 @@ class MultiAccountOrchestrator:
                 mtime = cfg_path.stat().st_mtime
                 if mtime == last_mtime:
                     continue
-                last_mtime = mtime
-                # 配置变了：重置所有退避计数
-                retry_state.clear()
                 with open(cfg_path, "r", encoding="utf-8") as f:
                     new_cfg = _yaml.safe_load(f) or {}
+                last_mtime = mtime
+                # 配置完整解析成功后再重置退避，解析失败时下一轮继续重试
+                retry_state.clear()
                 new_accounts = {a["name"]: a for a in new_cfg.get("accounts", []) if a.get("name")}
 
                 # 新增的账号 → 启动新 runner
@@ -755,19 +806,35 @@ async def main():
 
     cfg = load_config(Path(args.config))
     cfg["_config_path"] = args.config  # 让 runner 热读 rules
-    orch = MultiAccountOrchestrator(cfg, dry_run=args.dry_run, only_account=args.account)
+    process_lock = None
+    if not args.login:
+        from shared.process_lock import ProcessLock, read_live_pid
 
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, orch.request_stop)
-        except NotImplementedError:
-            pass
+        lock_path = Path("data/dy_main.lock")
+        pid_path = Path("data/dy_main.pid")
+        process_lock = ProcessLock(lock_path, pid_path)
+        if not process_lock.acquire():
+            existing_pid = read_live_pid(pid_path, lock_path)
+            logger.error("主引擎已经在运行%s", f" (PID={existing_pid})" if existing_pid else "")
+            raise RuntimeError("主引擎已经在运行，拒绝重复启动")
 
-    if args.login:
-        await orch.login_all()
-    else:
-        await orch.run()
+    try:
+        orch = MultiAccountOrchestrator(cfg, dry_run=args.dry_run, only_account=args.account)
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, orch.request_stop)
+            except NotImplementedError:
+                pass
+
+        if args.login:
+            await orch.login_all()
+        else:
+            await orch.run()
+    finally:
+        if process_lock:
+            process_lock.release()
 
 
 if __name__ == "__main__":

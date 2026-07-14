@@ -7,10 +7,16 @@ __pycache__/
 
 # Browser data
 browser_data/
+data/browser_profiles/
+data/browser_state/
+data/screenshots/
+data/snapshots/
 
 # Database
 data/*.db
 data/*.db-journal
+data/*.db-shm
+data/*.db-wal
 
 # Logs
 logs/
@@ -35,6 +41,7 @@ pytest-cache-files-*/
 .venv/
 .venv.broken/
 .worktrees/
+.playwright-browsers/
 
 # Frontend build/deps
 frontend/node_modules/
@@ -44,6 +51,7 @@ frontend/dist/
 autofish/config/config.yaml
 douying/config/config.yaml
 config/dy_reply.yaml
+config/.*.tmp
 
 # Build artifacts
 build/

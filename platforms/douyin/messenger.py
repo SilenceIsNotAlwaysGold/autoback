@@ -9,6 +9,7 @@ import json
 import logging
 import random
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,11 @@ class DouyinMessenger:
         self._recent_sent: dict[str, list[str]] = {}        # conv_name -> [最近 5 条我们发的]
         self.reply_cooldown_sec: float = 15.0               # 冷却时间
         self._observer_lock = asyncio.Lock()                # 防止并发重装 observer
+        self._realtime_wakeup = asyncio.Event()
+
+    def notify_page_changed(self):
+        """其它任务操作过共享页面后，唤醒实时私信恢复页面和观察器。"""
+        self._realtime_wakeup.set()
 
     async def fetch_conversations(self) -> list[dict[str, Any]]:
         """拉取会话列表，返回 [{index, name, last_msg, has_unread}, ...]
@@ -341,6 +347,8 @@ class DouyinMessenger:
         max_replies_per_round: int = 20,
         stop_event: asyncio.Event | None = None,
         heartbeat_sec: int = 300,
+        operation_guard=None,
+        ready_event: asyncio.Event | None = None,
     ):
         """事件驱动模式：页面常驻 + MutationObserver 秒回
 
@@ -353,10 +361,18 @@ class DouyinMessenger:
         Args:
             rules_provider: callable -> list[dict]，每轮调用获取最新规则（支持热改 YAML）
             stop_event: 外部停止信号
+            operation_guard: 返回异步上下文管理器，仅在实际操作页面时持锁
+            ready_event: 初始化完成信号，供评论任务等待
         """
         stop_event = stop_event or asyncio.Event()
         event_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
         processing_lock = asyncio.Lock()
+
+        @asynccontextmanager
+        async def _no_guard():
+            yield
+
+        guard_factory = operation_guard or _no_guard
 
         async def _on_changed(reason: str = ""):
             """JS observer 触发时调用；处理期间也允许入队，但 round 内部会去重"""
@@ -366,134 +382,156 @@ class DouyinMessenger:
             except asyncio.QueueFull:
                 pass
 
-        # 暴露给浏览器 JS（重启时可能已注册，忽略重复注册错误）
         try:
-            await self.page.expose_function("onConversationChanged", _on_changed)
-        except Exception:
-            pass
+            async with guard_factory():
+                # 暴露给浏览器 JS（重启时可能已注册，忽略重复注册错误）
+                try:
+                    await self.page.expose_function("onConversationChanged", _on_changed)
+                except Exception:
+                    pass
 
-        # 提前调一次 rules_provider 把 _user_reply_cooldown_sec 等配置注入 _account_config
-        # 否则 baseline 阶段读到的是默认值
-        if callable(rules_provider):
+                if callable(rules_provider):
+                    try:
+                        rules_provider()
+                    except Exception:
+                        pass
+
+                logger.info("[douyin/realtime] Opening %s", S.MESSAGING_URL)
+                await self.engine.goto(S.MESSAGING_URL)
+                await self.engine.human_delay(3, 5)
+                await self.engine.dismiss_popups()
+                try:
+                    await self.page.wait_for_selector(S.IM["conversation_list"], timeout=20000)
+                    await self.page.wait_for_selector(S.IM["name_selector"], timeout=10000)
+                    await self.engine.human_delay(1.5, 2.5)
+                except Exception as e:
+                    logger.error("[douyin/realtime] Initial list not ready: %s", e)
+                    return
+
+                # 只给无未读且仍在冷却期的会话设基线
+                if store:
+                    try:
+                        baseline_convs = await self.page.evaluate(r"""() => {
+                            const items = document.querySelectorAll('.semi-list-item');
+                            const out = [];
+                            for (const it of items) {
+                                const name = it.querySelector('[class^="item-header-name-"]')?.textContent?.trim() || '';
+                                const msg = it.querySelector('[class^="item-content-"] [class^="text-"]')?.textContent?.trim() || '';
+                                let unread = 0;
+                                const c = it.querySelector('[class*="badge"][class*="count"]');
+                                if (c) { const t = (c.textContent||'').trim(); if (/^\d+$/.test(t)) unread = parseInt(t); }
+                                out.push({ name, msg, unread });
+                            }
+                            return out;
+                        }""")
+                        cooldown_user = int(self._account_config.get(
+                            "_user_reply_cooldown_sec", self.reply_cooldown_sec
+                        ))
+                        silent = 0; active = 0; history = 0
+                        for c in baseline_convs:
+                            if not c["name"] or store.get_last_seen_msg(account_name, c["name"]) is not None:
+                                continue
+                            conv_id = f"dy_{c['name']}"
+                            since = store.seconds_since_last_reply(account_name, conv_id)
+                            in_cooldown = since is not None and since < cooldown_user
+                            if c.get("unread", 0) > 0:
+                                active += 1
+                            elif not in_cooldown:
+                                history += 1
+                            else:
+                                await store.update_last_seen(account_name, c["name"], c.get("msg", ""))
+                                silent += 1
+                        logger.info(
+                            "[douyin/realtime] Baseline done: %d silent, %d unread, %d historical-unreplied will be processed",
+                            silent, active, history,
+                        )
+                    except Exception as e:
+                        logger.warning("[douyin/realtime] Baseline failed: %s", e)
+
+                async with self._observer_lock:
+                    await self._do_install_observer()
+                logger.info("[douyin/realtime] MutationObserver installed (on body, subtree)")
+
+            if ready_event:
+                ready_event.set()
+
             try:
-                rules_provider()
-            except Exception:
+                event_queue.put_nowait(time.time())
+            except asyncio.QueueFull:
                 pass
 
-        # 打开并等待
-        logger.info("[douyin/realtime] Opening %s", S.MESSAGING_URL)
-        await self.engine.goto(S.MESSAGING_URL)
-        await self.engine.human_delay(3, 5)
-        await self.engine.dismiss_popups()
-        try:
-            await self.page.wait_for_selector(S.IM["conversation_list"], timeout=20000)
-            await self.page.wait_for_selector(S.IM["name_selector"], timeout=10000)
-            await self.engine.human_delay(1.5, 2.5)
-        except Exception as e:
-            logger.error("[douyin/realtime] Initial list not ready: %s", e)
-            return
-
-        # 基线：只给 **无未读** 的会话设基线；有未读的留空 → 第一轮会处理掉
-        if store:
-            try:
-                baseline_convs = await self.page.evaluate(r"""() => {
-                    const items = document.querySelectorAll('.semi-list-item');
-                    const out = [];
-                    for (const it of items) {
-                        const name = it.querySelector('[class^="item-header-name-"]')?.textContent?.trim() || '';
-                        const msg = it.querySelector('[class^="item-content-"] [class^="text-"]')?.textContent?.trim() || '';
-                        let unread = 0;
-                        const c = it.querySelector('[class*="badge"][class*="count"]');
-                        if (c) { const t = (c.textContent||'').trim(); if (/^\d+$/.test(t)) unread = parseInt(t); }
-                        out.push({ name, msg, unread });
-                    }
-                    return out;
-                }""")
-                cooldown_user = int(self._account_config.get("_user_reply_cooldown_sec",
-                                                            self.reply_cooldown_sec))
-                silent = 0; active = 0; history = 0
-                for c in baseline_convs:
-                    if not c["name"]:
-                        continue
-                    if store.get_last_seen_msg(account_name, c["name"]) is not None:
-                        continue
-                    conv_id = f"dy_{c['name']}"
-                    since = store.seconds_since_last_reply(account_name, conv_id)
-                    in_cooldown = since is not None and since < cooldown_user
-                    if c.get("unread", 0) > 0:
-                        # 有未读 → 不基线，留给下一轮处理（last_seen = None，diff 视为"新"）
-                        active += 1
-                    elif not in_cooldown:
-                        # 不在冷却期（含历史未回复或已过冷却时间）→ 留给第一轮处理
-                        history += 1
-                    else:
-                        # 冷却期内且无红点 → 静默基线
-                        await store.update_last_seen(account_name, c["name"], c.get("msg", ""))
-                        silent += 1
-                logger.info("[douyin/realtime] Baseline done: %d silent, %d unread, %d historical-unreplied will be processed",
-                            silent, active, history)
-            except Exception as e:
-                logger.warning("[douyin/realtime] Baseline failed: %s", e)
-
-        # 注入 observer（baseline 不刷页后再装；通过锁串行防并发）
-        async with self._observer_lock:
-            await self._do_install_observer()
-        logger.info("[douyin/realtime] MutationObserver installed (on body, subtree)")
-
-        # 启动后立刻触发一次首轮，处理历史未回复 + 当前未读
-        try:
-            event_queue.put_nowait(time.time())
-        except asyncio.QueueFull:
-            pass
-
-        # 事件处理循环
-        last_process = 0.0
-        while not stop_event.is_set():
-            try:
-                # 等 observer 事件 OR 心跳超时
+            while not stop_event.is_set():
                 try:
-                    await asyncio.wait_for(event_queue.get(), timeout=heartbeat_sec)
-                except asyncio.TimeoutError:
-                    logger.debug("[douyin/realtime] Heartbeat tick")
-                # 合并 100ms 内的连续事件（够用且几乎零延迟）
-                await asyncio.sleep(0.1)
-                while not event_queue.empty():
-                    try: event_queue.get_nowait()
-                    except asyncio.QueueEmpty: break
+                    queue_task = asyncio.create_task(event_queue.get())
+                    wake_task = asyncio.create_task(self._realtime_wakeup.wait())
+                    wait_tasks = {queue_task, wake_task}
+                    try:
+                        done, _ = await asyncio.wait(
+                            wait_tasks,
+                            timeout=heartbeat_sec,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        for task in wait_tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*wait_tasks, return_exceptions=True)
 
-                # 日上限
-                if store and store.today_reply_count(account_name, "pm") >= max_per_day:
-                    logger.warning("[douyin/realtime] Daily cap reached, sleeping 1h")
-                    await asyncio.wait_for(stop_event.wait(), timeout=3600)
-                    continue
+                    if not done:
+                        logger.debug("[douyin/realtime] Heartbeat tick")
+                    self._realtime_wakeup.clear()
 
-                async with processing_lock:
-                    rules = rules_provider() if callable(rules_provider) else rules_provider
-                    await self._run_one_round(
-                        rules=rules,
-                        ai_agent=ai_agent,
-                        store=store,
-                        account_name=account_name,
-                        dry_run=dry_run,
-                        skip_groups=skip_groups,
-                        max_replies=max_replies_per_round,
-                    )
-                last_process = time.time()
+                    await asyncio.sleep(0.1)
+                    while not event_queue.empty():
+                        try:
+                            event_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
 
-                # 停留在当前页面，让 observer 继续监听
-                # 只有 observer 不见了才补装（比如页面被跳走）
-                still_attached = await self.page.evaluate(
-                    "() => !!(window.__dyObs && window.__dyObsInstalled)"
-                )
-                if not still_attached:
-                    logger.info("[douyin/realtime] Observer lost, reinstalling")
-                    await self._reinstall_observer()
+                    if store and store.today_reply_count(account_name, "pm") >= max_per_day:
+                        logger.warning("[douyin/realtime] Daily cap reached, sleeping 1h")
+                        try:
+                            await asyncio.wait_for(stop_event.wait(), timeout=3600)
+                        except asyncio.TimeoutError:
+                            pass
+                        continue
 
-            except Exception as e:
-                logger.error("[douyin/realtime] Loop error: %s", e, exc_info=True)
-                await asyncio.sleep(5)
+                    async with guard_factory():
+                        if not await self._ensure_on_messaging():
+                            continue
+                        still_attached = await self.page.evaluate(
+                            "() => !!(window.__dyObs && window.__dyObsInstalled)"
+                        )
+                        if not still_attached:
+                            logger.info("[douyin/realtime] Observer lost, reinstalling")
+                            await self._reinstall_observer()
 
-        logger.info("[douyin/realtime] Stopped")
+                        async with processing_lock:
+                            rules = rules_provider() if callable(rules_provider) else rules_provider
+                            await self._run_one_round(
+                                rules=rules,
+                                ai_agent=ai_agent,
+                                store=store,
+                                account_name=account_name,
+                                dry_run=dry_run,
+                                skip_groups=skip_groups,
+                                max_replies=max_replies_per_round,
+                            )
+
+                        still_attached = await self.page.evaluate(
+                            "() => !!(window.__dyObs && window.__dyObsInstalled)"
+                        )
+                        if not still_attached:
+                            await self._reinstall_observer()
+
+                except Exception as e:
+                    logger.error("[douyin/realtime] Loop error: %s", e, exc_info=True)
+                    await asyncio.sleep(5)
+
+            logger.info("[douyin/realtime] Stopped")
+        finally:
+            if ready_event:
+                ready_event.set()
 
     async def _reinstall_observer(self):
         """页面切换后 observer 丢了，用同样逻辑补装一次（串行，防并发重装）"""
@@ -862,9 +900,17 @@ class DouyinMessenger:
             last_msg = incoming[-1]["text"]
             conv_id = f"dy_{conv['name']}"
 
-            # 用户级去重（按 conv name 作为 user_key）
-            if store and store.is_user_replied(account_name, conv_id):
-                logger.debug("[douyin] Skip already-replied user: %s", conv_id)
+            # 用户级冷却（轮询模式与实时模式保持一致，不做永久去重）
+            cooldown_user = int(self._account_config.get(
+                "_user_reply_cooldown_sec", self.reply_cooldown_sec
+            ))
+            since = store.seconds_since_last_reply(account_name, conv_id) if store else None
+            if since is not None and since < cooldown_user:
+                logger.debug("[douyin] User cooldown (%ds < %ds): %s",
+                             since, cooldown_user, conv_id)
+                await store.update_last_seen(
+                    account_name, conv["name"], conv.get("last_msg", "")
+                )
                 await self.engine.goto(S.MESSAGING_URL)
                 await self.engine.human_delay(2, 4)
                 continue
@@ -874,10 +920,25 @@ class DouyinMessenger:
             # 匹配规则动作 → AI 兜底（AI 仅返回文字）
             from shared.rules.engine import match_rule_action
             # 模式通过 account_config 注入（runner 每轮热读 YAML 时刷新）
-            mode = self._account_config.get("_reply_mode", "keyword")
+            keyword_enabled = self._account_config.get("_keyword_enabled", True)
+            brainless_enabled = self._account_config.get("_brainless_enabled", False)
             brainless = self._account_config.get("_brainless_replies", [])
-            action = match_rule_action(last_msg, rules, mode=mode, brainless_replies=brainless)
-            strategy = "brainless" if mode == "brainless" else "rule"
+            if not keyword_enabled and not brainless_enabled:
+                if store:
+                    await store.update_last_seen(
+                        account_name, conv["name"], conv.get("last_msg", "")
+                    )
+                await self.engine.goto(S.MESSAGING_URL)
+                await self.engine.human_delay(2, 4)
+                continue
+            action = match_rule_action(
+                last_msg,
+                rules,
+                keyword_enabled=keyword_enabled,
+                brainless_enabled=brainless_enabled,
+                brainless_replies=brainless,
+            )
+            strategy = (action or {}).get("strategy", "rule")
             if not action and ai:
                 try:
                     context = self._memory.get_context(conv_id)
@@ -888,6 +949,11 @@ class DouyinMessenger:
                 except Exception as e:
                     logger.warning("[douyin] AI reply failed: %s", e)
             if not action:
+                if store:
+                    await store.update_last_seen(
+                        account_name, conv["name"], conv.get("last_msg", "")
+                    )
+                await self.engine.goto(S.MESSAGING_URL)
                 continue
 
             # 随机延迟（模拟人类思考）

@@ -17,7 +17,7 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -36,15 +36,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-build.txt
 
+      - name: Download bundled Chromium
+        shell: cmd
+        run: |
+          set PLAYWRIGHT_BROWSERS_PATH=%CD%\.playwright-browsers
+          python -m playwright install chromium
+
       - name: Build with PyInstaller
         shell: cmd
         run: |
           pyinstaller dy_auto_reply_win.spec --clean --noconfirm
 
       - name: List build output
-        shell: cmd
+        shell: pwsh
         run: |
-          dir dist\dy_auto_reply
+          Get-ChildItem dist\dy_auto_reply
+          $chrome = Get-ChildItem dist\dy_auto_reply\_internal\playwright-browsers -Recurse -Filter chrome.exe
+          if (-not $chrome) {
+            throw "Bundled Chromium chrome.exe not found"
+          }
+          Write-Host "Bundled Chromium: $($chrome.FullName)"
 
       - name: Copy docs into dist
         shell: pwsh

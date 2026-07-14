@@ -234,14 +234,24 @@ class DouyinCommenter:
                     continue
 
             # 规则匹配（评论场景：不支持图片，只拼 text + text_after）
-            action = match_rule_action(c["text"], rules)
+            keyword_enabled = self._account_config.get("_keyword_enabled", True)
+            brainless_enabled = self._account_config.get("_brainless_enabled", False)
+            if not keyword_enabled and not brainless_enabled:
+                continue
+            action = match_rule_action(
+                c["text"],
+                rules,
+                keyword_enabled=keyword_enabled,
+                brainless_enabled=brainless_enabled,
+                brainless_replies=self._account_config.get("_brainless_replies", []),
+            )
             reply_text = ""
             if action:
                 parts = [p for p in [action.get("text"), action.get("text_after")] if p]
                 reply_text = " ".join(parts)
                 if action.get("image") and not reply_text:
                     logger.debug("[douyin-comment] Rule is image-only, skipping in comment context")
-            strategy = "rule"
+            strategy = (action or {}).get("strategy", "rule")
 
             # AI 兜底
             if not reply_text and ai_agent:

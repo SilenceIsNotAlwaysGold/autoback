@@ -10,12 +10,16 @@
 - 支持多条回复、匹配模式、图片、默认兜底
 
 注意：
-- 保存后主脚本 dy_auto_reply.py 需要重启才能生效
-  （或者等下一轮 120s 内自动重读 YAML —— 当前脚本每轮都重新解析）
+- 回复规则和模式开关会由运行中的主脚本按轮次热加载，无需重启
 """
 from __future__ import annotations
 
+import os
+import signal
 import sys
+import tempfile
+import threading
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -27,6 +31,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import uvicorn
+
+from shared.process_lock import pid_is_running, read_live_pid
 
 # 数据目录：打包模式 = APP_DATA，开发模式 = 项目根（与 ROOT 相同）
 try:
@@ -81,8 +87,74 @@ def load_config() -> dict:
 
 def save_config(cfg: dict):
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False, indent=2)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=CONFIG_PATH.parent,
+            prefix=f".{CONFIG_PATH.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = Path(f.name)
+            yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, CONFIG_PATH)
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _child_env(log_file: Path) -> dict[str, str]:
+    """让开发版和 windowed 冻结版子进程统一输出 UTF-8 日志。"""
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["DY_STDIO_LOG"] = str(log_file.resolve())
+    return env
+
+
+def _new_process_group_kwargs() -> dict:
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _terminate_process_tree(target: subprocess.Popen | int, timeout: float = 5) -> None:
+    """终止主进程及其 Chromium/Playwright 子进程。"""
+    proc = target if isinstance(target, subprocess.Popen) else None
+    pid = proc.pid if proc else int(target)
+    if sys.platform == "win32":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            startupinfo=startupinfo,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            check=False,
+        )
+    else:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    if proc:
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=timeout)
+    else:
+        deadline = time.monotonic() + timeout
+        while pid_is_running(pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        if pid_is_running(pid):
+            raise TimeoutError(f"进程树未能在 {timeout} 秒内停止: PID={pid}")
 
 
 def normalize_rule(r: dict) -> dict:
@@ -257,13 +329,14 @@ def _spawn_login(name: str, acc: dict) -> tuple[bool, str, int]:
     log_file = log_dir / f"login_{name}.log"
 
     main_script = ROOT / "scripts" / "dy_auto_reply.py"
+    logf = None
     try:
         # 关闭上一次的 logf（若存在）
         old_logf = _login_logfs.pop(name, None)
         if old_logf:
             try: old_logf.close()
             except Exception: pass
-        logf = open(log_file, "w", buffering=1)
+        logf = open(log_file, "w", encoding="utf-8", buffering=1)
         # 打包模式：复用主 exe + --mode=login；开发模式：调 python 脚本
         if getattr(sys, "frozen", False):
             cmd = [sys.executable, "--mode=login", "--account", name]
@@ -275,11 +348,16 @@ def _spawn_login(name: str, acc: dict) -> tuple[bool, str, int]:
             cmd,
             cwd=cwd,
             stdout=logf, stderr=subprocess.STDOUT,
+            env=_child_env(log_file),
+            **_new_process_group_kwargs(),
         )
         _login_procs[name] = proc
         _login_logfs[name] = logf
         return True, "已启动", proc.pid
     except Exception as e:
+        if logf:
+            try: logf.close()
+            except Exception: pass
         return False, str(e), 0
 
 
@@ -371,14 +449,37 @@ def api_bulk_proxy(payload: BulkProxyPayload):
 _main_proc: subprocess.Popen | None = None
 _main_logf: object = None          # 主脚本 logf 句柄
 _main_log_path = _DATA_ROOT / "logs" / "dy_main.log"
+_main_lock_path = _DATA_ROOT / "data" / "dy_main.lock"
+_main_pid_path = _DATA_ROOT / "data" / "dy_main.pid"
+_main_state_lock = threading.Lock()
+
+
+def _current_main_pid() -> int | None:
+    global _main_proc
+    if _main_proc and _main_proc.poll() is None:
+        return _main_proc.pid
+    _main_proc = None
+    return read_live_pid(_main_pid_path, _main_lock_path)
+
+
+def _clear_main_pid(pid: int | None = None) -> None:
+    try:
+        current = int(_main_pid_path.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return
+    if pid is None or current == pid:
+        try:
+            _main_pid_path.unlink()
+        except OSError:
+            pass
 
 
 @app.get("/api/main/status")
 def api_main_status():
     """返回主脚本运行状态 + 最近日志"""
-    global _main_proc
-    running = _main_proc is not None and _main_proc.poll() is None
-    pid = _main_proc.pid if running else None
+    with _main_state_lock:
+        pid = _current_main_pid()
+    running = pid is not None
     # 最近 30 行日志
     tail: list[str] = []
     if _main_log_path.exists():
@@ -394,58 +495,73 @@ def api_main_status():
 @app.post("/api/main/start")
 def api_main_start():
     global _main_proc, _main_logf
-    if _main_proc and _main_proc.poll() is None:
-        return {"ok": False, "message": f"主脚本已在运行 PID={_main_proc.pid}"}
-    main_script = ROOT / "scripts" / "dy_auto_reply.py"
-    try:
-        _main_log_path.parent.mkdir(exist_ok=True)
-        # 关闭上一次的 logf
-        if _main_logf:
-            try: _main_logf.close()
-            except Exception: pass
-        logf = open(_main_log_path, "w", buffering=1)
-        if getattr(sys, "frozen", False):
-            cmd = [sys.executable, "--mode=main"]
-            cwd = None
-        else:
-            cmd = [sys.executable, "-u", str(main_script)]
-            cwd = str(ROOT)
-        _main_proc = subprocess.Popen(
-            cmd,
-            cwd=cwd,
-            stdout=logf, stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        _main_logf = logf
-        return {"ok": True, "pid": _main_proc.pid, "message": "主脚本已启动"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    with _main_state_lock:
+        existing_pid = _current_main_pid()
+        if existing_pid:
+            return {"ok": False, "message": f"主脚本已在运行 PID={existing_pid}"}
+        main_script = ROOT / "scripts" / "dy_auto_reply.py"
+        logf = None
+        try:
+            _main_log_path.parent.mkdir(exist_ok=True)
+            if _main_logf:
+                try: _main_logf.close()
+                except Exception: pass
+            logf = open(_main_log_path, "w", encoding="utf-8", buffering=1)
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "--mode=main"]
+                cwd = None
+            else:
+                cmd = [sys.executable, "-u", str(main_script)]
+                cwd = str(ROOT)
+            _main_proc = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                stdout=logf, stderr=subprocess.STDOUT,
+                env=_child_env(_main_log_path),
+                **_new_process_group_kwargs(),
+            )
+            _main_logf = logf
+            return {"ok": True, "pid": _main_proc.pid, "message": "主脚本已启动"}
+        except Exception as e:
+            if logf:
+                try: logf.close()
+                except Exception: pass
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/main/stop")
 def api_main_stop():
     global _main_proc, _main_logf
-    import os, signal as _sig
-    if not _main_proc or _main_proc.poll() is not None:
-        _main_proc = None
-        return {"ok": True, "message": "主脚本未在运行"}
-    try:
-        # Unix: 终止整个进程组（含子进程）；Windows 无 killpg，直接 terminate
-        if hasattr(os, "killpg"):
-            os.killpg(os.getpgid(_main_proc.pid), _sig.SIGTERM)
-        else:
-            _main_proc.terminate()
-        _main_proc.wait(timeout=5)
-    except Exception:
-        try: _main_proc.kill()
-        except Exception: pass
-    finally:
-        if _main_logf:
-            try: _main_logf.close()
-            except Exception: pass
-            _main_logf = None
-    _main_proc = None
-    return {"ok": True, "message": "已停止"}
+    with _main_state_lock:
+        pid = _current_main_pid()
+        if not pid:
+            return {"ok": True, "message": "主脚本未在运行"}
+        proc = _main_proc if _main_proc and _main_proc.pid == pid else None
+        stopped = False
+        stop_error = ""
+        try:
+            _terminate_process_tree(proc or pid)
+            stopped = not pid_is_running(pid)
+        except Exception as e:
+            stop_error = str(e)
+            if proc:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+            stopped = not pid_is_running(pid)
+        finally:
+            if _main_logf:
+                try: _main_logf.close()
+                except Exception: pass
+                _main_logf = None
+            if stopped:
+                _clear_main_pid(pid)
+                _main_proc = None
+        if not stopped:
+            return {"ok": False, "message": f"停止失败：{stop_error or '进程仍在运行'}"}
+        return {"ok": True, "message": "已停止"}
 
 
 @app.post("/api/accounts/login-all")

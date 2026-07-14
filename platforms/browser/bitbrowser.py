@@ -27,6 +27,7 @@ class BitBrowserClient:
 
     def __init__(self, api_base: str = DEFAULT_API):
         self.api_base = api_base.rstrip("/")
+        self._playwright_handles: dict[str, Any] = {}
 
     async def _post(self, path: str, data: dict) -> dict:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -145,14 +146,32 @@ class BitBrowserClient:
         ws_url = result["data"]["ws"]
 
         # CDP 连接
+        await self.close_playwright(window_id)
         pw = await async_playwright().start()
-        browser = await pw.chromium.connect_over_cdp(ws_url)
-
-        context = browser.contexts[0] if browser.contexts else await browser.new_context()
-        page = context.pages[0] if context.pages else await context.new_page()
+        try:
+            browser = await pw.chromium.connect_over_cdp(ws_url)
+            context = browser.contexts[0] if browser.contexts else await browser.new_context()
+            page = context.pages[0] if context.pages else await context.new_page()
+        except Exception:
+            await pw.stop()
+            try:
+                await self.close_window(window_id)
+            except Exception:
+                pass
+            raise
+        self._playwright_handles[window_id] = pw
 
         logger.info("[bitbrowser] Playwright connected via CDP: %s", window_id[:12])
         return browser, context, page, ws_url
+
+    async def close_playwright(self, window_id: str):
+        """关闭指定窗口对应的 Playwright Driver。"""
+        pw = self._playwright_handles.pop(window_id, None)
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
 
     async def get_cookies(self, window_id: str, url: str = "") -> str:
         """打开窗口 → 访问 URL → 抓取 cookie → 关闭窗口
@@ -172,8 +191,11 @@ class BitBrowserClient:
             logger.info("[bitbrowser] Got %d cookies from %s", len(cookies), window_id[:12])
             return cookie_str
         finally:
-            await browser.close()
-            await self.close_window(window_id)
+            try:
+                await browser.close()
+            finally:
+                await self.close_playwright(window_id)
+                await self.close_window(window_id)
 
     # ── 便捷方法 ──────────────────────────────────────────
 
