@@ -38,7 +38,7 @@ def match_rule_action(
 ) -> dict | None:
     """根据规则列表匹配消息，返回完整动作字典
 
-    优先级：keyword_enabled 命中 > brainless_enabled 兜底 > None
+    优先级：关键词命中 > 无脑兜底（开启且有文案）> is_default 默认规则 > None
 
     Args:
         message: 用户发送的消息
@@ -62,24 +62,41 @@ def match_rule_action(
     if not message:
         return None
 
-    # 1. 关键词匹配（优先级最高）
+    brainless_texts = [t for t in (brainless_replies or []) if t]
+
+    # 1. 关键词匹配（优先级最高）。如果无脑兜底已开启且有文案，
+    #    未命中的消息先交给无脑兜底，最后才落到 is_default。
     if keyword_enabled and rules:
-        action = _match_keyword(message, rules)
+        action = _match_keyword(
+            message,
+            rules,
+            include_default=not (brainless_enabled and brainless_texts),
+        )
         if action:
-            action["strategy"] = "keyword"
+            action.setdefault("strategy", "keyword")
             return action
 
     # 2. 无脑兜底
-    if brainless_enabled:
-        texts = [t for t in (brainless_replies or []) if t]
-        if texts:
-            return {"text": random.choice(texts), "image": "", "text_after": "", "strategy": "brainless"}
+    if brainless_enabled and brainless_texts:
+        return {
+            "text": random.choice(brainless_texts),
+            "image": "",
+            "text_after": "",
+            "strategy": "brainless",
+        }
+
+    # 3. 默认规则兜底（关键词开关打开时才使用）
+    if keyword_enabled and rules:
+        action = _match_default(rules)
+        if action:
+            action["strategy"] = "default"
+            return action
 
     # 两者都没命中
     return None
 
 
-def _match_keyword(message: str, rules: list[dict]) -> dict | None:
+def _match_keyword(message: str, rules: list[dict], include_default: bool = True) -> dict | None:
     """关键词匹配（内部函数）"""
     if not message or not rules:
         return None
@@ -90,7 +107,10 @@ def _match_keyword(message: str, rules: list[dict]) -> dict | None:
     for rule in rules:
         # 默认回复规则（先记下来，等遍历完如果没有 matched 再用）
         if rule.get("is_default"):
-            default_action = _build_action(rule)
+            if include_default:
+                default_action = _build_action(rule)
+                if default_action:
+                    default_action["strategy"] = "default"
             continue
 
         match_mode = rule.get("match_mode", "contains")
@@ -118,6 +138,14 @@ def _match_keyword(message: str, rules: list[dict]) -> dict | None:
                 return _build_action(rule)
 
     return default_action
+
+
+def _match_default(rules: list[dict]) -> dict | None:
+    """返回 is_default 默认动作。"""
+    for rule in rules:
+        if rule.get("is_default"):
+            return _build_action(rule)
+    return None
 
 
 def _pick_reply(rule: dict) -> str:

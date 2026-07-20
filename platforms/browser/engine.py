@@ -8,7 +8,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,54 @@ def _mask_proxy_url(url: str) -> str:
         return f"{scheme}://***@{host}"
     except ValueError:
         return "***"
+
+
+def _playwright_chromium_executable() -> Path | None:
+    try:
+        import playwright
+
+        browsers_json = (
+            Path(playwright.__file__).parent
+            / "driver"
+            / "package"
+            / "browsers.json"
+        )
+        data = json.loads(browsers_json.read_text(encoding="utf-8"))
+        revision = next(
+            item["revision"]
+            for item in data.get("browsers", [])
+            if item.get("name") == "chromium"
+        )
+    except Exception:
+        return None
+
+    roots: list[Path] = []
+    env_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if env_root and env_root != "0":
+        roots.append(Path(env_root))
+    if sys.platform == "darwin":
+        roots.append(Path.home() / "Library" / "Caches" / "ms-playwright")
+    elif sys.platform == "win32":
+        roots.append(Path.home() / "AppData" / "Local" / "ms-playwright")
+    else:
+        roots.append(Path.home() / ".cache" / "ms-playwright")
+
+    for root in roots:
+        base = root / f"chromium-{revision}"
+        if sys.platform == "win32":
+            candidates = [base / "chrome-win64" / "chrome.exe"]
+        elif sys.platform == "darwin":
+            candidates = [
+                base / "chrome-mac" / "Chromium.app" / "Contents" / "MacOS" / "Chromium",
+                base / "chrome-mac-arm64" / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing",
+                base / "chrome-mac-x64" / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing",
+            ]
+        else:
+            candidates = [base / "chrome-linux" / "chrome"]
+        found = next((path for path in candidates if path.exists()), None)
+        if found:
+            return found
+    return None
 
 
 class BrowserEngine:
@@ -91,9 +141,6 @@ class BrowserEngine:
             "--disable-gpu",
             "--disable-gpu-compositing",
         ]
-        if self.headless:
-            chrome_args.append("--headless=new")
-
         # 代理配置
         # Chromium 不支持带认证的 SOCKS5，也不太稳定处理 HTTP 认证弹窗
         # → 用 pproxy 起本地 HTTP 桥接，对 Chromium 透明
@@ -151,16 +198,21 @@ class BrowserEngine:
                 "--webrtc-ip-handling-policy=disable_non_proxied_udp",
             ]
 
-        self.context = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            headless=False,
-            viewport=vp,
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-            args=chrome_args,
-            proxy=proxy,
-            ignore_https_errors=True,
-        )
+        launch_kwargs = {
+            "user_data_dir": str(profile_dir),
+            "headless": self.headless,
+            "viewport": vp,
+            "locale": "zh-CN",
+            "timezone_id": "Asia/Shanghai",
+            "args": chrome_args,
+            "proxy": proxy,
+            "ignore_https_errors": True,
+        }
+        chromium_exe = _playwright_chromium_executable()
+        if chromium_exe:
+            launch_kwargs["executable_path"] = str(chromium_exe)
+
+        self.context = await self._playwright.chromium.launch_persistent_context(**launch_kwargs)
         # 注入账号专属反检测脚本（每个账号指纹不同）
         await self.context.add_init_script(generate_stealth_script(self.account_name))
 

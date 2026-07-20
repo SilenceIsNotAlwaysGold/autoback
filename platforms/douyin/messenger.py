@@ -115,8 +115,9 @@ class DouyinMessenger:
         try:
             await self.page.wait_for_selector(S.IM["conversation_list"], timeout=15000)
         except Exception:
-            logger.warning("[douyin] Conversation list not visible for read_messages (15s)")
-            return []
+            logger.warning("[douyin] Conversation list not visible for read_messages (15s), restoring")
+            if not await self._ensure_on_messaging():
+                return []
 
         # 按名字用 Playwright 原生 click 点击（触发完整事件链路）
         target_item = None
@@ -452,6 +453,23 @@ class DouyinMessenger:
                     await self._do_install_observer()
                 logger.info("[douyin/realtime] MutationObserver installed (on body, subtree)")
 
+                if store and store.today_reply_count(account_name, "pm") < max_per_day:
+                    rules = rules_provider() if callable(rules_provider) else rules_provider
+                    await self._run_one_round(
+                        rules=rules,
+                        ai_agent=ai_agent,
+                        store=store,
+                        account_name=account_name,
+                        dry_run=dry_run,
+                        skip_groups=skip_groups,
+                        max_replies=max_replies_per_round,
+                    )
+                    still_attached = await self.page.evaluate(
+                        "() => !!(window.__dyObs && window.__dyObsInstalled)"
+                    )
+                    if not still_attached:
+                        await self._reinstall_observer()
+
             if ready_event:
                 ready_event.set()
 
@@ -563,12 +581,17 @@ class DouyinMessenger:
         }""")
 
     async def _ensure_on_messaging(self) -> bool:
-        """确保当前在消息列表页，只在 URL 不对时才 goto（避免无意义刷新）"""
+        """确保当前在消息列表页，并且会话列表 DOM 已经可见。"""
         try:
             cur = self.page.url
             if "/following/chat" in cur or "/messaging" in cur:
-                return True
-            logger.info("[douyin] Not on messaging page (%s), navigating once", cur)
+                try:
+                    await self.page.wait_for_selector(S.IM["conversation_list"], timeout=3000)
+                    return True
+                except Exception:
+                    logger.info("[douyin] Messaging URL is active but list is not visible, restoring")
+            else:
+                logger.info("[douyin] Not on messaging page (%s), navigating once", cur)
             await self.engine.goto(S.MESSAGING_URL)
             await self.engine.human_delay(2, 3)
             await self.engine.dismiss_popups()
@@ -645,6 +668,8 @@ class DouyinMessenger:
             success = await self._process_conv(conv, rules, ai, store, account_name, dry_run)
             if success:
                 replied_count += 1
+            if replied_count < max_replies:
+                await self._ensure_on_messaging()
         logger.info("[douyin] Round done: %d/%d replied", replied_count, len(unread))
         return replied_count
 

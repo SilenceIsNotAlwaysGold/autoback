@@ -1,4 +1,4 @@
-# 抖音自动回复脚本配置示例（10+ 账号矩阵模式）
+# 抖音自动回复脚本配置示例
 # 用法：cp dy_reply.example.yaml dy_reply.yaml && 编辑后 python scripts/dy_auto_reply.py
 
 # ── 运行时参数 ──────────────────────────────────
@@ -17,27 +17,21 @@ store:
   db_path: data/dy_reply.db
 
 # ── 账号列表 ─────────────────────────────────────
-# 每个账号可独立配置代理 / 比特浏览器窗口
-# 未填代理/比特浏览器时走本地 Playwright（账号级指纹隔离已内置）
+# 默认只放 1 个干净账号，首次启动后在配置 UI 里按需添加更多账号。
+# 每个账号可独立配置代理 / 比特浏览器窗口。
+# 未填代理/比特浏览器时走本地 Playwright（账号级指纹隔离已内置）。
 accounts:
   - name: dy_acc1
     login_timeout: 180
     # ──── 方案 A：纯本地 profile（1-3 号可用）
     # 留空即可
 
-  - name: dy_acc2
-    login_timeout: 180
-    # ──── 方案 B：HTTP/SOCKS5 代理（3-10 号推荐静态住宅代理）
-    proxy_url: "http://user:pass@1.2.3.4:8080"
+  # ──── 方案 B：HTTP/SOCKS5 代理（3-10 号推荐静态住宅代理）
+  # proxy_url: "socks5://用户名:密码@代理IP:端口"
 
-  - name: dy_acc3
-    login_timeout: 180
-    # ──── 方案 C：比特浏览器窗口（10+ 号推荐）
-    # 需先在比特浏览器客户端里创建窗口，复制窗口 ID 填在这里
-    # 窗口里已配置好代理 + 独立指纹，脚本 CDP 连接即可
-    bitbrowser_id: "abc123def456"
-
-  # ... 可继续加 dy_acc4 ~ dy_accN
+  # ──── 方案 C：比特浏览器窗口（10+ 号推荐）
+  # 需先在比特浏览器客户端里创建窗口，复制窗口 ID 填在这里
+  # bitbrowser_id: "你的窗口ID"
 
 # ── 私信自动回复 ─────────────────────────────────
 # 真实入口：/creator-micro/data/following/chat
@@ -50,7 +44,7 @@ messenger:
 
 # ── 评论自动回复 ─────────────────────────────────
 commenter:
-  enabled: true
+  enabled: false
   max_replies_per_round: 30
   poll_interval: 120
   max_per_day: 300
@@ -98,7 +92,7 @@ rules:
 ai:
   enabled: false
   api_base: https://api.deepseek.com/v1
-  api_key: "sk-xxx"
+  api_key: ""
   model: deepseek-chat
   custom_prompts:
     default: |

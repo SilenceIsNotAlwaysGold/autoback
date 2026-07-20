@@ -39,6 +39,7 @@ pytest-cache-files-*/
 # Local runtime/temp
 .tmp/
 .venv/
+.venv-arm64/
 .venv.broken/
 .worktrees/
 .playwright-browsers/

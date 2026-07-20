@@ -79,6 +79,14 @@ class ReplyModePayload(BaseModel):
     mode: str | None = None
 
 
+class RuntimeTogglesPayload(BaseModel):
+    messenger_enabled: bool = True
+    commenter_enabled: bool = False
+
+
+PLACEHOLDER_MARKERS = ("1.2.3.4", "user:pass@", "example.com", "abc123", "sk-xxx")
+
+
 def load_config() -> dict:
     path = CONFIG_PATH if CONFIG_PATH.exists() else EXAMPLE_PATH
     with open(path, "r", encoding="utf-8") as f:
@@ -155,6 +163,55 @@ def _terminate_process_tree(target: subprocess.Popen | int, timeout: float = 5) 
             time.sleep(0.1)
         if pid_is_running(pid):
             raise TimeoutError(f"进程树未能在 {timeout} 秒内停止: PID={pid}")
+
+
+def _has_placeholder(value: str) -> bool:
+    return bool(value) and any(marker in value for marker in PLACEHOLDER_MARKERS)
+
+
+def _setup_status(cfg: dict) -> dict:
+    accounts = cfg.get("accounts") or []
+    rules = cfg.get("rules") or []
+    ai_cfg = cfg.get("ai") or {}
+    warnings: list[str] = []
+
+    if not accounts:
+        warnings.append("还没有账号，先添加至少 1 个账号。")
+
+    for account in accounts:
+        name = account.get("name") or "未命名账号"
+        proxy = account.get("proxy_url", "") or ""
+        bitbrowser_id = account.get("bitbrowser_id", "") or ""
+        if _has_placeholder(proxy):
+            warnings.append(f"{name} 的代理还是示例占位符，请删除或换成真实代理。")
+        if _has_placeholder(bitbrowser_id):
+            warnings.append(f"{name} 的比特浏览器窗口 ID 还是示例占位符。")
+
+    if not rules:
+        warnings.append("还没有回复规则，启动后不会产生有效回复。")
+
+    messenger_enabled = bool(cfg.get("messenger", {}).get("enabled", True))
+    if not messenger_enabled:
+        warnings.append("私信自动回复已关闭，启动后不会监听私信。")
+
+    if ai_cfg.get("enabled"):
+        api_key = ai_cfg.get("api_key", "") or ""
+        if not api_key.strip():
+            warnings.append("AI 已开启但没有填写 API Key。")
+        elif _has_placeholder(api_key):
+            warnings.append("AI API Key 还是示例占位符，请清空或换成真实 Key。")
+
+    actionable_warnings = [
+        w for w in warnings
+        if "占位符" in w or "还没有账号" in w or "API Key" in w or "私信自动回复已关闭" in w
+    ]
+    return {
+        "ready_to_start": not actionable_warnings,
+        "warnings": warnings,
+        "account_count": len(accounts),
+        "rule_count": len(rules),
+        "config_exists": CONFIG_PATH.exists(),
+    }
 
 
 def normalize_rule(r: dict) -> dict:
@@ -254,17 +311,46 @@ def api_save_reply_mode(payload: ReplyModePayload):
     }
 
 
+@app.get("/api/runtime-toggles")
+def api_get_runtime_toggles():
+    cfg = load_config()
+    return {
+        "messenger_enabled": bool(cfg.get("messenger", {}).get("enabled", True)),
+        "commenter_enabled": bool(cfg.get("commenter", {}).get("enabled", False)),
+    }
+
+
+@app.post("/api/runtime-toggles")
+def api_save_runtime_toggles(payload: RuntimeTogglesPayload):
+    if not payload.messenger_enabled:
+        raise HTTPException(status_code=400, detail="私信自动回复不能关闭")
+    cfg = load_config()
+    cfg.setdefault("messenger", {})["enabled"] = payload.messenger_enabled
+    cfg.setdefault("commenter", {})["enabled"] = False
+    save_config(cfg)
+    return {
+        "ok": True,
+        "messenger_enabled": payload.messenger_enabled,
+        "commenter_enabled": False,
+    }
+
+
 @app.get("/api/meta")
 def api_meta():
     """其它配置摘要（只读展示）"""
     cfg = load_config()
     return {
         "accounts": [a.get("name") for a in cfg.get("accounts", [])],
-        "messenger_enabled": cfg.get("messenger", {}).get("enabled"),
-        "commenter_enabled": cfg.get("commenter", {}).get("enabled"),
+        "messenger_enabled": cfg.get("messenger", {}).get("enabled", True),
         "ai_enabled": cfg.get("ai", {}).get("enabled"),
         "config_path": str(CONFIG_PATH),
     }
+
+
+@app.get("/api/setup-status")
+def api_setup_status():
+    """返回首次配置健康状态，用于启动前提示。"""
+    return _setup_status(load_config())
 
 
 # ── 账号管理 API ────────────────────────────────────
@@ -496,6 +582,15 @@ def api_main_status():
 def api_main_start():
     global _main_proc, _main_logf
     with _main_state_lock:
+        cfg = load_config()
+        cfg.setdefault("commenter", {})["enabled"] = False
+        save_config(cfg)
+        setup = _setup_status(cfg)
+        if not setup["ready_to_start"]:
+            raise HTTPException(
+                status_code=400,
+                detail="请先处理配置问题：" + "；".join(setup["warnings"]),
+            )
         existing_pid = _current_main_pid()
         if existing_pid:
             return {"ok": False, "message": f"主脚本已在运行 PID={existing_pid}"}
@@ -653,6 +748,27 @@ HTML = r"""<!doctype html>
     color: var(--muted);
   }
   .meta code { color: var(--text); }
+  .setup-banner {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: -8px 0 16px;
+    font-size: 13px;
+    display: none;
+  }
+  .setup-banner.ok {
+    display: block;
+    background: rgba(16, 185, 129, 0.12);
+    border-color: rgba(16, 185, 129, 0.45);
+    color: #bbf7d0;
+  }
+  .setup-banner.warn {
+    display: block;
+    background: rgba(245, 158, 11, 0.12);
+    border-color: rgba(245, 158, 11, 0.45);
+    color: #fde68a;
+  }
+  .setup-banner div + div { margin-top: 4px; }
   .toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
   button {
     background: var(--accent);
@@ -771,6 +887,7 @@ HTML = r"""<!doctype html>
   <div class="sub">编辑关键词 → 命中规则 → 自动回复。保存后主脚本下一轮（60s内）生效。</div>
 
   <div class="meta" id="meta">加载中...</div>
+  <div class="setup-banner" id="setup-banner"></div>
 
   <!-- 运行控制台 -->
   <div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px;margin-bottom:16px">
@@ -914,6 +1031,11 @@ async function refreshMainStatus() {
 }
 
 async function startMain() {
+  const setup = await refreshSetupStatus();
+  if (setup && !setup.ready_to_start) {
+    alert('启动前需要先处理：\n' + (setup.warnings || []).join('\n'));
+    return;
+  }
   const r = await fetch('/api/main/start', { method: 'POST' }).then(r => r.json());
   if (r.ok) {
     toast('🚀 主脚本已启动，开始监听');
@@ -934,6 +1056,29 @@ function toggleMainLog() {
   const p = document.getElementById('main-log-panel');
   p.style.display = p.style.display === 'none' ? 'block' : 'none';
   if (p.style.display !== 'none') refreshMainStatus();
+}
+
+async function refreshSetupStatus() {
+  try {
+    const status = await fetch('/api/setup-status').then(r => r.json());
+    const banner = document.getElementById('setup-banner');
+    const warnings = status.warnings || [];
+    if (status.ready_to_start) {
+      banner.className = 'setup-banner ok';
+      banner.innerHTML = `
+        <div><strong>配置状态正常</strong> · ${status.account_count || 0} 个账号 · ${status.rule_count || 0} 条规则</div>
+      `;
+    } else {
+      banner.className = 'setup-banner warn';
+      banner.innerHTML = `
+        <div><strong>启动前检查</strong> · ${status.account_count || 0} 个账号 · ${status.rule_count || 0} 条规则</div>
+        <div>${warnings.map(w => '• ' + esc(w)).join('<br>')}</div>
+      `;
+    }
+    return status;
+  } catch (e) {
+    return null;
+  }
 }
 
 async function load() {
@@ -962,10 +1107,10 @@ async function load() {
   document.getElementById('meta').innerHTML = `
     账号: <code>${(metaRes.accounts || []).join(', ') || '（未配置）'}</code> ·
     私信: <code>${metaRes.messenger_enabled ? '✅' : '❌'}</code> ·
-    评论: <code>${metaRes.commenter_enabled ? '✅' : '❌'}</code> ·
     AI: <code>${metaRes.ai_enabled ? '✅' : '❌'}</code><br>
     <span style="font-size:11px">配置文件: ${metaRes.config_path}</span>
   `;
+  refreshSetupStatus();
   render();
   loadAccounts();
 }
@@ -1109,6 +1254,7 @@ async function saveAccounts() {
       body: JSON.stringify({ accounts }),
     }).then(r => r.json());
     toast(r.ok ? `✅ 已保存 ${r.count} 个账号` : ('❌ ' + (r.detail || r.message)), !r.ok);
+    if (r.ok) refreshSetupStatus();
   } catch (e) { toast('❌ ' + e.message, true); }
 }
 
@@ -1433,8 +1579,12 @@ async function save() {
       body: JSON.stringify({ rules }),
     });
     const data = await res.json();
-    if (data.ok) toast(`✅ 已保存 ${data.count} 条规则`);
-    else toast('❌ 保存失败: ' + (data.detail || 'unknown'), true);
+    if (data.ok) {
+      toast(`✅ 已保存 ${data.count} 条规则`);
+      refreshSetupStatus();
+    } else {
+      toast('❌ 保存失败: ' + (data.detail || 'unknown'), true);
+    }
   } catch (e) {
     toast('❌ 请求失败: ' + e.message, true);
   }

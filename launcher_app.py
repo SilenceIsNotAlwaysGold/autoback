@@ -113,9 +113,15 @@ def _setup_paths():
         meipass = Path(getattr(sys, "_MEIPASS", ""))
         if meipass and str(meipass) not in sys.path:
             sys.path.insert(0, str(meipass))
-        # 自包含 Windows 包优先使用随程序分发的 Chromium，不依赖本机缓存或首次下载。
-        bundled_pw = meipass / "playwright-browsers"
-        if bundled_pw.exists():
+        # 自包含包优先使用随程序分发的 Chromium，不依赖本机缓存或首次下载。
+        bundled_candidates = [meipass / "playwright-browsers"]
+        if sys.platform == "darwin":
+            bundled_candidates.insert(
+                0,
+                Path(sys.executable).resolve().parents[1] / "Resources" / "playwright-browsers",
+            )
+        bundled_pw = next((path for path in bundled_candidates if path.exists()), None)
+        if bundled_pw:
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled_pw)
         elif not os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
             if sys.platform == "darwin":
@@ -155,13 +161,25 @@ def _expected_chromium_exe() -> Path | None:
                     if b.get("name") == "chromium"), None)
         if not rev:
             return None
-        pw_path = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
-                       or (Path.home() / "AppData" / "Local" / "ms-playwright"))
+        env_pw_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+        if env_pw_path:
+            pw_path = Path(env_pw_path)
+        elif sys.platform == "darwin":
+            pw_path = Path.home() / "Library" / "Caches" / "ms-playwright"
+        elif sys.platform == "win32":
+            pw_path = Path.home() / "AppData" / "Local" / "ms-playwright"
+        else:
+            pw_path = Path.home() / ".cache" / "ms-playwright"
         base = pw_path / f"chromium-{rev}"
         if sys.platform == "win32":
             return base / "chrome-win64" / "chrome.exe"
         if sys.platform == "darwin":
-            return base / "chrome-mac" / "Chromium.app" / "Contents" / "MacOS" / "Chromium"
+            candidates = [
+                base / "chrome-mac" / "Chromium.app" / "Contents" / "MacOS" / "Chromium",
+                base / "chrome-mac-arm64" / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing",
+                base / "chrome-mac-x64" / "Google Chrome for Testing.app" / "Contents" / "MacOS" / "Google Chrome for Testing",
+            ]
+            return next((path for path in candidates if path.exists()), candidates[0])
         return base / "chrome-linux" / "chrome"
     except Exception:
         return None
